@@ -1,7 +1,8 @@
 # app.py - Analysis 系统：侧栏导航（入库 / 标准化数据产品）
 
 import os
-import importlib.util
+import sys
+import importlib
 from datetime import date
 from io import BytesIO
 import streamlit as st
@@ -9,25 +10,28 @@ import pandas as pd
 
 from config import DB_CONFIG
 
-# 动态加载 handlers
-def _load_handler(module_name: str, file_name: str):
-    app_dir = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.join(app_dir, "handlers", file_name)
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    if spec is None or spec.loader is None:
-        return None
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+# 确保项目根目录在 path 中，以便 handlers 作为包导入（相对导入 .data_utils 才能工作）
+_app_dir = os.path.dirname(os.path.abspath(__file__))
+if _app_dir not in sys.path:
+    sys.path.insert(0, _app_dir)
 
-_rank_mod = _load_handler("ranking_handler", "ranking_handler.py")
-_op_mod = _load_handler("operator_handler", "operator_handler.py")
-_nat_mod = _load_handler("national_handler", "national_handler.py")
-_prov_mod = _load_handler("province_handler", "province_handler.py")
-_power_mod = _load_handler("power_handler", "power_handler.py")
-_cg_mod = _load_handler("citygroup_handler", "citygroup_handler.py")
-_hw_mod = _load_handler("highway_handler", "highway_handler.py")
-_ratio_mod = _load_handler("ratio_handler", "ratio_handler.py")
+
+def _load_handler(module_path: str):
+    """按包路径加载 handler，失败返回 None。"""
+    try:
+        return importlib.import_module(module_path)
+    except ImportError:
+        return None
+
+
+_rank_mod = _load_handler("handlers.ranking_handler")
+_op_mod = _load_handler("handlers.operator_handler")
+_nat_mod = _load_handler("handlers.national_handler")
+_prov_mod = _load_handler("handlers.province_handler")
+_power_mod = _load_handler("handlers.power_handler")
+_cg_mod = _load_handler("handlers.citygroup_handler")
+_hw_mod = _load_handler("handlers.highway_handler")
+_ratio_mod = _load_handler("handlers.ratio_handler")
 
 
 def _detect_table_type(df: pd.DataFrame) -> bool:
@@ -358,12 +362,10 @@ else:
     st.success(f"已加载 {len(df):,} 行数据（{data_type}表）。")
     export_date = _export_date()
 
-    # 1) 排行榜
+    # 1) 排行榜 P1（1.1～1.6）
     if _rank_mod:
         st.markdown("### 排行榜")
         rank_tables = _rank_mod.get_all_ranking_tables(df, for_pile=for_pile)
-        if not for_pile and not _has_city_col(df):
-            st.info("当前为充电站表且无城市列，城市榜不展示。")
         for idx, (_group, title, tbl) in enumerate(rank_tables):
             st.markdown(f"**{title}**")
             st.dataframe(tbl, use_container_width=True, hide_index=True)
@@ -381,10 +383,14 @@ else:
                 st.download_button("导出 CSV", data=buf2.getvalue(), file_name=f"排行榜_{title[:10]}_{export_date}.csv", mime="text/csv", key=f"dl_rank_csv_{idx}")
         st.markdown("---")
 
-    # 2) 各运营商数据
+    # 2) 各运营商数据 P2（数据维度 2.1～2.11）
     if _op_mod:
         st.markdown("### 各运营商数据")
-        op_tbl = _op_mod.operator_table(df, for_pile=for_pile)
+        dim_options = _op_mod.get_operator_dimension_options()
+        dim_labels = [name for _, name in dim_options]
+        dim_keys = [k for k, _ in dim_options]
+        sel_dim_idx = st.selectbox("数据维度", range(len(dim_labels)), format_func=lambda i: dim_labels[i], key="op_dimension")
+        op_tbl = _op_mod.operator_table_by_dimension(df, for_pile=for_pile, dimension_key=dim_keys[sel_dim_idx])
         st.dataframe(op_tbl, use_container_width=True, hide_index=True)
         c1, c2 = st.columns(2)
         with c1:
@@ -509,7 +515,7 @@ else:
         cols = st.columns(len(ratio_cards))
         for i, (k, v) in enumerate(ratio_cards.items()):
             cols[i].metric(k, v)
-        ratio_tbl = _ratio_mod.ratio_provinces_table(df)
+        ratio_tbl = _ratio_mod.ratio_provinces_table(df, for_pile=for_pile)
         st.dataframe(ratio_tbl, use_container_width=True, hide_index=True)
         buf = BytesIO()
         ratio_tbl.to_excel(buf, index=False, engine="openpyxl")

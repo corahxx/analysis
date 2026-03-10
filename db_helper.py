@@ -63,7 +63,9 @@ def read_table(table_name: str) -> Optional[pd.DataFrame]:
 
 
 def _mysql_type(col_name: str, dtype) -> str:
-    """根据列名与 dtype 返回 MySQL 类型。"""
+    """根据列名与 dtype 返回 MySQL 类型。经度/纬度 INT；序号不设主键（仅列类型 BIGINT）。"""
+    if col_name in ("经度", "纬度"):
+        return "INT"
     if pd.api.types.is_integer_dtype(dtype):
         return "BIGINT"
     if pd.api.types.is_float_dtype(dtype):
