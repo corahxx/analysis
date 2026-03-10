@@ -1,6 +1,8 @@
 # db_helper.py - evdata 库：表列表、读表、建表、入库
+# 连接方式与 charging-agent 一致：get_db_url、连接池、test_connection
 
 from typing import List, Optional, Tuple
+import os
 import pandas as pd
 
 from config import DB_CONFIG
@@ -11,14 +13,42 @@ DEFAULT_VARCHAR_LEN = 500
 DATE_VARCHAR_LEN = 50
 
 
-def _engine():
-    """返回 SQLAlchemy engine（utf8mb4）。"""
-    from sqlalchemy import create_engine
-    url = (
-        f"mysql+pymysql://{DB_CONFIG['user']}:{DB_CONFIG['password']}"
-        f"@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}?charset=utf8mb4"
+def _get_config():
+    """与 charging-agent 一致：环境变量优先于 config。"""
+    return {
+        "host": os.getenv("DB_HOST") or DB_CONFIG.get("host", "localhost"),
+        "port": int(os.getenv("DB_PORT") or str(DB_CONFIG.get("port", 3306))),
+        "user": os.getenv("DB_USER") or DB_CONFIG.get("user", "root"),
+        "password": os.getenv("DB_PASSWORD") or DB_CONFIG.get("password", ""),
+        "database": os.getenv("DB_NAME") or DB_CONFIG.get("database", "evdata"),
+    }
+
+
+def get_db_url() -> str:
+    """与 charging-agent db_utils.get_db_url 一致。"""
+    cfg = _get_config()
+    return (
+        f"mysql+pymysql://{cfg['user']}:{cfg['password']}"
+        f"@{cfg['host']}:{cfg['port']}/{cfg['database']}?charset=utf8mb4"
     )
-    return create_engine(url)
+
+_global_engine = None
+
+
+def _engine():
+    """返回 SQLAlchemy engine（连接池与 charging-agent 一致，单例复用）。"""
+    global _global_engine
+    if _global_engine is None:
+        from sqlalchemy import create_engine
+        _global_engine = create_engine(
+            get_db_url(),
+            pool_size=5,
+            max_overflow=10,
+            pool_pre_ping=True,
+            pool_recycle=3600,
+            pool_timeout=30,
+        )
+    return _global_engine
 
 
 def get_connection():
@@ -26,16 +56,42 @@ def get_connection():
     return _engine()
 
 
-def list_tables() -> List[str]:
-    """返回 evdata 库内所有表名列表。连接失败返回空列表。"""
+def test_connection() -> Tuple[bool, str]:
+    """与 charging-agent db_utils.test_connection 一致。返回 (success, message)。"""
+    engine = None
+    try:
+        from sqlalchemy import create_engine, text
+        engine = create_engine(
+            get_db_url(),
+            pool_size=1,
+            max_overflow=0,
+            pool_pre_ping=True,
+            pool_recycle=3600,
+        )
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return True, "数据库连接成功"
+    except Exception as e:
+        return False, str(e)[:500]
+    finally:
+        if engine:
+            try:
+                engine.dispose()
+            except Exception:
+                pass
+
+
+def list_tables_with_status() -> Tuple[List[str], Optional[str]]:
+    """返回 (表名列表, 错误信息)。连接失败时 error 为异常信息；成功无表为 ([], None)。"""
     try:
         import pymysql
+        cfg = _get_config()
         conn = pymysql.connect(
-            host=DB_CONFIG["host"],
-            port=DB_CONFIG["port"],
-            user=DB_CONFIG["user"],
-            password=DB_CONFIG["password"],
-            database=DB_CONFIG["database"],
+            host=cfg["host"],
+            port=cfg["port"],
+            user=cfg["user"],
+            password=cfg["password"],
+            database=cfg["database"],
             charset="utf8mb4",
         )
         try:
@@ -43,12 +99,18 @@ def list_tables() -> List[str]:
                 cur.execute("SHOW TABLES")
                 rows = cur.fetchall()
                 if rows and len(rows[0]) >= 1:
-                    return [r[0] for r in rows]
-                return []
+                    return ([r[0] for r in rows], None)
+                return ([], None)
         finally:
             conn.close()
-    except Exception:
-        return []
+    except Exception as e:
+        return ([], str(e)[:500])
+
+
+def list_tables() -> List[str]:
+    """返回 evdata 库内所有表名列表。连接失败返回空列表。"""
+    tables, _ = list_tables_with_status()
+    return tables
 
 
 def read_table(table_name: str) -> Optional[pd.DataFrame]:
@@ -78,6 +140,52 @@ def _mysql_type(col_name: str, dtype) -> str:
     if any(k in col_name for k in ("时间", "日期", "投入使用", "开通", "生产", "入库")):
         return f"VARCHAR({DATE_VARCHAR_LEN})"
     return f"VARCHAR({DEFAULT_VARCHAR_LEN})"
+
+
+def suggest_mysql_type(col_name: str, dtype) -> str:
+    """根据列名与 dtype 推断建议的 MySQL 类型（通用，用于「其他」类型表格）。"""
+    if pd.api.types.is_integer_dtype(dtype):
+        return "BIGINT"
+    if pd.api.types.is_float_dtype(dtype):
+        return "DOUBLE"
+    if pd.api.types.is_bool_dtype(dtype):
+        return "VARCHAR(10)"
+    if pd.api.types.is_datetime64_any_dtype(dtype):
+        return f"VARCHAR({DATE_VARCHAR_LEN})"
+    # 字符串、object 或未知
+    if col_name == "充电站位置":
+        return f"VARCHAR({LOCATION_MAX_LEN})"
+    if any(k in col_name for k in ("时间", "日期", "投入使用", "开通", "生产", "入库")):
+        return f"VARCHAR({DATE_VARCHAR_LEN})"
+    return f"VARCHAR({DEFAULT_VARCHAR_LEN})"
+
+
+# 可供用户选择的 MySQL 类型（「其他」表结构设置用）
+MYSQL_TYPE_OPTIONS = [
+    "VARCHAR(50)", "VARCHAR(100)", "VARCHAR(255)", "VARCHAR(500)", "VARCHAR(1000)",
+    "TEXT", "INT", "BIGINT", "DOUBLE", "DECIMAL(18,2)", "DATE", "DATETIME",
+]
+
+
+def create_table_from_schema(engine, table_name: str, schema: List[Tuple[str, str]]) -> bool:
+    """
+    根据 (列名, MySQL类型) 列表创建表。若表已存在则不覆盖，返回 False；否则创建并返回 True。
+    schema: [(col_name, mysql_type_str), ...]，如 [("姓名", "VARCHAR(100)"), ("年龄", "INT")]。
+    """
+    from sqlalchemy import text
+    with engine.connect() as conn:
+        r = conn.execute(text(f"SHOW TABLES LIKE '{table_name}'"))
+        if r.fetchone():
+            return False
+    cols = []
+    for col_name, mysql_t in schema:
+        safe_c = col_name.replace("`", "``")
+        cols.append(f"`{safe_c}` {mysql_t}")
+    create_sql = f"CREATE TABLE `{table_name}` (" + ", ".join(cols) + ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    with engine.connect() as conn:
+        conn.execute(text(create_sql))
+        conn.commit()
+    return True
 
 
 def create_table_from_df(engine, table_name: str, df: pd.DataFrame) -> bool:

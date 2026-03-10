@@ -174,6 +174,14 @@ if st.session_state.view_mode == "入库":
         st.text_input("Database", value=DB_CONFIG["database"], key="db_name", disabled=True)
     with c3:
         st.text_input("Password", value="********", key="db_pwd", disabled=True, type="password")
+    st.caption("与 charging-agent 共用同一配置：可通过环境变量 DB_HOST、DB_PORT、DB_USER、DB_PASSWORD、DB_NAME 覆盖上方默认值。")
+    if st.button("测试连接", key="test_conn_import"):
+        from db_helper import test_connection
+        ok, msg = test_connection()
+        if ok:
+            st.success(msg)
+        else:
+            st.error("连接失败：" + msg)
 
     st.markdown("### 入库方式")
     import_mode = st.radio(
@@ -187,12 +195,14 @@ if st.session_state.view_mode == "入库":
     target_table = ""
     if import_mode == "evdata 表追加数据":
         try:
-            from db_helper import list_tables
-            tables = list_tables()
-        except Exception:
-            tables = []
-        if not tables:
-            st.warning("无法连接数据库或库内无表。请检查 config 配置。")
+            from db_helper import list_tables_with_status
+            tables, db_error = list_tables_with_status()
+        except Exception as e:
+            tables, db_error = [], str(e)[:500]
+        if db_error:
+            st.error("连接失败：" + db_error)
+        elif not tables:
+            st.warning("连接成功，但当前库内无表。")
         else:
             target_table = st.selectbox("选择目标表", options=tables, key="import_target_table")
     else:
@@ -203,31 +213,93 @@ if st.session_state.view_mode == "入库":
         )
         target_table = new_table_name.strip()
 
+    table_type_import = st.selectbox(
+        "表类型",
+        options=["充电桩表", "充电站表", "其他"],
+        index=0,
+        key="import_table_type",
+        help="充电桩表/充电站表按标准字段校验；其他可导入任意表头并自定义字段类型。",
+    )
+
     st.markdown("### 执行入库")
     import_file = st.file_uploader(
         "选择清洗后文件",
         type=["xlsx", "xls", "csv"],
         key="import_upload",
-        help="支持 Excel / CSV，列需与 merge 清洗后一致",
+        help="支持 Excel / CSV，列需与 merge 清洗后一致；选「其他」时可导入任意表头表格",
     )
 
-    table_type_import = "充电桩表"
+    df_other_full = None
     if import_file is not None:
         try:
-            if import_file.name.lower().endswith(".csv"):
-                _preview_df = pd.read_csv(import_file, encoding="utf-8-sig", nrows=5)
+            if table_type_import == "其他":
+                import_file.seek(0)
+                if import_file.name.lower().endswith(".csv"):
+                    df_other_full = pd.read_csv(import_file, encoding="utf-8-sig")
+                else:
+                    df_other_full = pd.read_excel(import_file, engine="openpyxl")
             else:
-                _preview_df = pd.read_excel(import_file, engine="openpyxl", nrows=5)
-            import_file.seek(0)
-            detected_pile = _detect_table_type(_preview_df)
-            table_type_import = st.selectbox(
-                "表类型",
-                options=["充电桩表", "充电站表"],
-                index=0 if detected_pile else 1,
-                key="import_table_type",
-            )
+                if import_file.name.lower().endswith(".csv"):
+                    pd.read_csv(import_file, encoding="utf-8-sig", nrows=5)
+                else:
+                    pd.read_excel(import_file, engine="openpyxl", nrows=5)
+                import_file.seek(0)
         except Exception as e:
-            st.error(f"预览失败：{e}")
+            st.error(f"读取文件失败：{e}")
+
+    # ---------- 「其他」类型：识别表头 + 建议字段类型 + 确认后建表并导入 ----------
+    if table_type_import == "其他" and df_other_full is not None and not df_other_full.empty:
+        st.markdown("### 表结构设置（其他类型表格）")
+        st.caption("已识别表头，请核对并调整各列建议的数据库字段类型，确认后将创建新表并导入数据。")
+        from db_helper import suggest_mysql_type, MYSQL_TYPE_OPTIONS, get_connection, create_table_from_schema, insert_df_to_table
+
+        cols = list(df_other_full.columns)
+        suggested = [suggest_mysql_type(c, df_other_full[c].dtype) for c in cols]
+        # 若建议类型不在选项中则加入
+        type_choices = list(MYSQL_TYPE_OPTIONS)
+        for s in suggested:
+            if s and s not in type_choices:
+                type_choices.append(s)
+        schema = []
+        for i, col in enumerate(cols):
+            sug = suggested[i] if suggested[i] in type_choices else "VARCHAR(500)"
+            idx = type_choices.index(sug) if sug in type_choices else 0
+            sel = st.selectbox(
+                f"列「{col}」类型",
+                options=type_choices,
+                index=idx,
+                key=f"other_type_{i}_{col}",
+            )
+            schema.append((col, sel))
+        other_table_name = st.text_input(
+            "新表名称（必填）",
+            value=st.session_state.get("import_other_table_name", ""),
+            key="import_other_table_name",
+            placeholder="例如：my_data_20250101",
+        )
+        if st.button("确认表结构并导入", type="primary", key="do_import_other"):
+            if not other_table_name or not other_table_name.strip():
+                st.warning("请填写新表名称。")
+            else:
+                final_name = other_table_name.strip()
+                engine = get_connection()
+                try:
+                    created = create_table_from_schema(engine, final_name, schema)
+                    if created:
+                        st.success(f"已创建新表：{final_name}")
+                    else:
+                        st.warning(f"表 {final_name} 已存在，将追加数据。")
+                    success, fail, errors = insert_df_to_table(engine, final_name, df_other_full)
+                    st.metric("成功", success)
+                    st.metric("失败", fail)
+                    if errors:
+                        with st.expander("错误详情（前若干条）"):
+                            for err in errors:
+                                st.code(err)
+                except Exception as e:
+                    st.error(f"建表或导入失败：{e}")
+        st.markdown("---")
+        st.stop()
 
     if st.button("执行入库", type="primary", key="do_import"):
         if import_file is None:
@@ -323,12 +395,14 @@ else:
     elif data_source == "从数据库选择表":
         st.markdown("### 选择表")
         try:
-            from db_helper import list_tables, read_table
-            tables = list_tables()
-        except Exception:
-            tables = []
-        if not tables:
-            st.warning("无法连接数据库或库内无表。请检查 config 配置并确保 evdata 库可访问。")
+            from db_helper import list_tables_with_status, read_table
+            tables, db_error = list_tables_with_status()
+        except Exception as e:
+            tables, db_error = [], str(e)[:500]
+        if db_error:
+            st.error("连接失败：" + db_error)
+        elif not tables:
+            st.warning("连接成功，但当前库内无表。请检查 config 配置并确保 evdata 库可访问。")
         else:
             selected_table = st.selectbox("选择表", options=tables, key="db_table_select")
             if st.session_state.get("db_table_loaded") and st.session_state.get("db_table_loaded") != selected_table:

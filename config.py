@@ -1,5 +1,5 @@
 # config.py - Analysis 系统配置
-# 支持环境变量覆盖，优先级：环境变量 > 配置文件（用于一键入库）
+# 支持环境变量覆盖，优先级：环境变量 > 配置文件（与 charging-agent 一致）
 
 import os
 
