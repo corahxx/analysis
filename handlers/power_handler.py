@@ -1,17 +1,17 @@
-# handlers/power_handler.py - 功率段分布 P6（桩表按序号计数，站表站内>2+充电站内部编号去重）
+# handlers/power_handler.py - 功率段分布 P6（按省多 Sheet；桩/站均按行数、额定功率/站点总装机功率分档）
 
-from typing import Optional, Tuple
+from io import BytesIO
+from typing import Dict, List, Optional, Tuple
+
 import pandas as pd
 
-from .data_utils import pile_count_col, filter_stations_with_more_than_2_piles, station_id_col
-
-
-POWER_BINS = [
-    (0, 120, "p<120kW"),
-    (120, 250, "120≤p<250kW"),
-    (250, 480, "250≤p<480kW"),
-    (480, 960, "480≤p<960kW"),
-    (960, float("inf"), "960≤p kW"),
+# 固定顺序与文案（与产品约定一致）
+POWER_SEGMENT_LABELS = [
+    "p < 120kW",
+    "120-250kW",
+    "250-480kW",
+    "480-960kW",
+    "960kW+",
 ]
 
 
@@ -23,62 +23,162 @@ def _power_column(df: pd.DataFrame, for_pile: bool) -> Optional[str]:
     return None
 
 
+def _province_col(df: pd.DataFrame) -> Optional[str]:
+    if "省份_中文" in df.columns:
+        return "省份_中文"
+    if "省份" in df.columns:
+        return "省份"
+    return None
+
+
 def _assign_power_bin(ser: pd.Series) -> pd.Series:
-    """将功率序列映射为功率段标签。"""
+    """将已数值化、无 NA 的功率序列映射为功率段标签。"""
     out = pd.Series(index=ser.index, dtype=object)
-    for low, high, label in POWER_BINS:
-        if high == float("inf"):
-            mask = ser >= low
-        else:
-            mask = (ser >= low) & (ser < high)
-        out.loc[mask] = label
+    out.loc[ser < 120] = POWER_SEGMENT_LABELS[0]
+    out.loc[(ser >= 120) & (ser < 250)] = POWER_SEGMENT_LABELS[1]
+    out.loc[(ser >= 250) & (ser < 480)] = POWER_SEGMENT_LABELS[2]
+    out.loc[(ser >= 480) & (ser < 960)] = POWER_SEGMENT_LABELS[3]
+    out.loc[ser >= 960] = POWER_SEGMENT_LABELS[4]
     return out
 
 
+def _power_segment_table_from_valid_df(df_valid: pd.DataFrame, col: str) -> pd.DataFrame:
+    """df_valid 仅含有效功率行；按行数统计各档。"""
+    s = pd.to_numeric(df_valid[col], errors="coerce")
+    s = s.dropna()
+    if s.empty:
+        return pd.DataFrame(columns=["功率段", "数量", "占比", "环比"])
+    bins = _assign_power_bin(s)
+    cnt = df_valid.loc[s.index].assign(_功率段_=bins).groupby("_功率段_", dropna=False).size()
+    total = int(cnt.sum())
+    counts = [int(cnt.get(lb, 0)) for lb in POWER_SEGMENT_LABELS]
+    pcts = [f"{(c / total * 100):.1f}%" if total else "0%" for c in counts]
+    return pd.DataFrame(
+        {
+            "功率段": POWER_SEGMENT_LABELS,
+            "数量": counts,
+            "占比": pcts,
+            "环比": [""] * len(POWER_SEGMENT_LABELS),
+        }
+    )
+
+
 def power_distribution_table(df: pd.DataFrame, for_pile: bool = True) -> pd.DataFrame:
-    """功率段数量/占比表。桩表：按额定功率分档，每档对序号 count；站表：站内>2 后按站点总装机功率分档，充电站内部编号去重计数。"""
+    """全国汇总（不按省）：五档数量/占比，环比空。桩/站均按行数。"""
     col = _power_column(df, for_pile)
     if col is None:
         return pd.DataFrame(columns=["功率段", "数量", "占比", "环比"])
-    if for_pile:
-        s = pd.to_numeric(df[col], errors="coerce").dropna()
-        if s.empty:
-            return pd.DataFrame(columns=["功率段", "数量", "占比", "环比"])
-        df_ = df.loc[s.index].copy()
-        df_["_功率段_"] = _assign_power_bin(s)
-        pc = pile_count_col(df_, True)
-        if pc:
-            cnt = df_.groupby("_功率段_", dropna=False)[pc].count()
-        else:
-            cnt = df_.groupby("_功率段_", dropna=False).size()
+    s = pd.to_numeric(df[col], errors="coerce")
+    valid_idx = s.dropna().index
+    if valid_idx.empty:
+        return pd.DataFrame(columns=["功率段", "数量", "占比", "环比"])
+    return _power_segment_table_from_valid_df(df.loc[valid_idx], col)
+
+
+def power_distribution_by_province_tables(
+    df: pd.DataFrame, for_pile: bool = True
+) -> List[Tuple[str, pd.DataFrame]]:
+    """
+    返回 [(sheet_name, DataFrame), ...]。
+    有省份列时按省拆分；无省份列时单表「全部」。
+    """
+    col = _power_column(df, for_pile)
+    if col is None:
+        return []
+    prov_col = _province_col(df)
+    used_names: set = set()
+    out: List[Tuple[str, pd.DataFrame]] = []
+
+    if prov_col is None:
+        s = pd.to_numeric(df[col], errors="coerce")
+        valid = df.loc[s.dropna().index]
+        name = _sanitize_sheet_name("全部", used_names)
+        tbl = _power_segment_table_from_valid_df(valid, col)
+        out.append((name, tbl))
+        return out
+
+    df = df.copy()
+    df["_prov_"] = df[prov_col].fillna("未知").astype(str)
+    for prov in sorted(df["_prov_"].unique(), key=lambda x: (x == "未知", x)):
+        sub = df[df["_prov_"] == prov]
+        s = pd.to_numeric(sub[col], errors="coerce")
+        valid = sub.loc[s.dropna().index]
+        sheet = _sanitize_sheet_name(prov, used_names)
+        out.append((sheet, _power_segment_table_from_valid_df(valid, col)))
+    return out
+
+
+def write_power_province_workbook(df: pd.DataFrame, for_pile: bool = True) -> Optional[BytesIO]:
+    """多 Sheet xlsx；无功率列返回 None。"""
+    pairs = power_distribution_by_province_tables(df, for_pile=for_pile)
+    if not pairs:
+        return None
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        for sheet_name, tbl in pairs:
+            # pandas 对 sheet 名长度会处理，但先保证 sanitize
+            safe = sheet_name[:31]
+            tbl.to_excel(writer, sheet_name=safe, index=False)
+    buf.seek(0)
+    return buf
+
+
+def _sanitize_sheet_name(name: str, used: set) -> str:
+    import re
+
+    s = str(name).strip() or "Sheet"
+    s = re.sub(r'[\[\]\\*/?:]', "_", s)
+    s = s[:31] if s else "Sheet"
+    base = s
+    n = 1
+    while s in used:
+        suffix = f"_{n}"
+        s = (base[: max(1, 31 - len(suffix))] + suffix)[:31]
+        n += 1
+    used.add(s)
+    return s
+
+
+def list_power_preview_provinces(df: pd.DataFrame, for_pile: bool = True) -> List[str]:
+    """供 UI selectbox：逻辑省份名（与 tables 中 sheet 对应）。"""
+    col = _power_column(df, for_pile)
+    if col is None:
+        return []
+    prov_col = _province_col(df)
+    if prov_col is None:
+        return ["全部"]
+    df = df.copy()
+    names = sorted(
+        df[prov_col].fillna("未知").astype(str).unique().tolist(),
+        key=lambda x: (x == "未知", x),
+    )
+    return names
+
+
+def power_distribution_table_for_province(
+    df: pd.DataFrame, for_pile: bool, province: str
+) -> pd.DataFrame:
+    """预览某一省（或「全部」）的功率段表。"""
+    col = _power_column(df, for_pile)
+    if col is None:
+        return pd.DataFrame(columns=["功率段", "数量", "占比", "环比"])
+    prov_col = _province_col(df)
+    if prov_col is None or province == "全部":
+        s = pd.to_numeric(df[col], errors="coerce")
+        return _power_segment_table_from_valid_df(df.loc[s.dropna().index], col)
+    sub = df[df[prov_col].fillna("未知").astype(str) == province]
+    s = pd.to_numeric(sub[col], errors="coerce")
+    return _power_segment_table_from_valid_df(sub.loc[s.dropna().index], col)
+
+
+def power_distribution_chart_data(
+    df: pd.DataFrame, for_pile: bool = True, province: Optional[str] = None
+) -> Tuple[list, list]:
+    """返回 (功率段标签列表, 数量列表)。province 为 None 时全国汇总；否则指定省或「全部」。"""
+    if province is None:
+        t = power_distribution_table(df, for_pile=for_pile)
     else:
-        filtered = filter_stations_with_more_than_2_piles(df, False)
-        if filtered.empty:
-            return pd.DataFrame(columns=["功率段", "数量", "占比", "环比"])
-        p = pd.to_numeric(filtered[col], errors="coerce").dropna()
-        if p.empty:
-            return pd.DataFrame(columns=["功率段", "数量", "占比", "环比"])
-        sid = station_id_col(filtered)
-        if sid is None:
-            return pd.DataFrame(columns=["功率段", "数量", "占比", "环比"])
-        filtered = filtered.loc[p.index].copy()
-        filtered["_功率段_"] = _assign_power_bin(p)
-        cnt = filtered.groupby("_功率段_", dropna=False)[sid].nunique()
-    total = cnt.sum()
-    labels = [POWER_BINS[i][2] for i in range(len(POWER_BINS))]
-    counts = [int(cnt.get(lb, 0)) for lb in labels]
-    pcts = [f"{(c / total * 100):.1f}%" if total else "0%" for c in counts]
-    return pd.DataFrame({
-        "功率段": labels,
-        "数量": counts,
-        "占比": pcts,
-        "环比": ["—"] * len(labels),
-    })
-
-
-def power_distribution_chart_data(df: pd.DataFrame, for_pile: bool = True) -> Tuple[list, list]:
-    """返回 (功率段标签列表, 数量列表) 用于绘图。"""
-    t = power_distribution_table(df, for_pile=for_pile)
+        t = power_distribution_table_for_province(df, for_pile, province)
     if t.empty:
         return [], []
     return t["功率段"].tolist(), t["数量"].tolist()

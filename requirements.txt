@@ -5,4 +5,5 @@ xlrd
 matplotlib
 Pillow
 pymysql
+psycopg2-binary
 sqlalchemy

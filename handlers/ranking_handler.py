@@ -1,9 +1,9 @@
-# handlers/ranking_handler.py - 排行榜 P1：1.1 市场份额、1.2 设施销量(占位)、1.3 城市榜、1.4 星级(占位)、1.5 型号榜、1.6 车企私桩(占位)
+# handlers/ranking_handler.py - 排行榜：六 Sheet 标准列名与导出（按行数统计）
 
-from typing import Optional, Tuple, List
+from io import BytesIO
+from typing import List, Optional, Tuple
+
 import pandas as pd
-
-from .data_utils import pile_count_col, agg_pile_count
 
 
 def _operator_col(df: pd.DataFrame) -> Optional[str]:
@@ -22,103 +22,161 @@ def _city_col(df: pd.DataFrame) -> Optional[str]:
     return None
 
 
-def market_share_top(df: pd.DataFrame, for_pile: bool = True, top_n: int = 10) -> pd.DataFrame:
-    """1.1 存量市场份额榜 Top N：排名、运营商、设施总量、市场份额、环比增速（占位）。充电桩数量用序号计数。"""
+def sheet_market_share(df: pd.DataFrame) -> pd.DataFrame:
+    """市场份额榜：全量运营商，按公共充电设施总量（行数）降序。"""
+    cols = ["运营商", "公共充电设施总量", "市场份额", "环比增速"]
     op_col = _operator_col(df)
     if op_col is None:
-        return pd.DataFrame(columns=["排名", "运营商", "设施总量", "市场份额", "环比增速"])
-    agg = agg_pile_count(df, op_col, for_pile)
-    if agg.empty:
-        return pd.DataFrame(columns=["排名", "运营商", "设施总量", "市场份额", "环比增速"])
-    total = agg.sum()
-    agg = agg.sort_values(ascending=False).head(top_n)
-    out = pd.DataFrame({
-        "排名": range(1, len(agg) + 1),
-        "运营商": agg.index.astype(str).tolist(),
-        "设施总量": agg.values.tolist(),
-        "市场份额": [f"{(v / total * 100):.1f}%" for v in agg.values],
-        "环比增速": ["—"] * len(agg),
-    })
+        return pd.DataFrame(columns=cols)
+    g = df.groupby(df[op_col].fillna("未知").astype(str), dropna=False).size()
+    g = g.sort_values(ascending=False)
+    total = int(g.sum())
+    if total == 0:
+        return pd.DataFrame(columns=cols)
+    return pd.DataFrame(
+        {
+            "运营商": g.index.tolist(),
+            "公共充电设施总量": g.values.astype(int).tolist(),
+            "市场份额": [f"{(v / total * 100):.1f}%" for v in g.values],
+            "环比增速": [""] * len(g),
+        }
+    )
+
+
+def sheet_facility_sales(df: pd.DataFrame) -> pd.DataFrame:
+    """设施销量榜：仅列出运营商，其余列空。"""
+    cols = ["运营商", "新增销量", "环比增量", "环比增速"]
+    op_col = _operator_col(df)
+    if op_col is None:
+        return pd.DataFrame(columns=cols)
+    ops = sorted(df[op_col].fillna("未知").astype(str).unique().tolist())
+    return pd.DataFrame(
+        {
+            "运营商": ops,
+            "新增销量": [""] * len(ops),
+            "环比增量": [""] * len(ops),
+            "环比增速": [""] * len(ops),
+        }
+    )
+
+
+def sheet_city_top10(df: pd.DataFrame) -> pd.DataFrame:
+    """城市榜 Top10：按行数，全国占比分母为全表行数。"""
+    cols = ["城市", "公共充电设施总量", "全国占比", "环比增速"]
+    city_col = _city_col(df)
+    if city_col is None:
+        return pd.DataFrame(columns=cols)
+    g = df.groupby(df[city_col].fillna("未知").astype(str), dropna=False).size()
+    g = g.sort_values(ascending=False).head(10)
+    total = len(df)
+    return pd.DataFrame(
+        {
+            "城市": g.index.tolist(),
+            "公共充电设施总量": g.values.astype(int).tolist(),
+            "全国占比": [
+                f"{(v / total * 100):.1f}%" if total else "0%" for v in g.values
+            ],
+            "环比增速": [""] * len(g),
+        }
+    )
+
+
+def sheet_star_station(df: pd.DataFrame) -> pd.DataFrame:
+    """星级场站榜：仅运营商列有去重名单，其余空。"""
+    cols = ["运营商", "星级场站数", "占比", "五星级场站数"]
+    op_col = _operator_col(df)
+    if op_col is None:
+        return pd.DataFrame(columns=cols)
+    ops = sorted(df[op_col].fillna("未知").astype(str).unique().tolist())
+    return pd.DataFrame(
+        {
+            "运营商": ops,
+            "星级场站数": [""] * len(ops),
+            "占比": [""] * len(ops),
+            "五星级场站数": [""] * len(ops),
+        }
+    )
+
+
+def sheet_model_rank(df: pd.DataFrame, for_pile: bool) -> pd.DataFrame:
+    """型号榜：桩表按充电桩型号行数；站表仅表头。"""
+    cols = ["设备型号", "装机量"]
+    if not for_pile or "充电桩型号" not in df.columns:
+        return pd.DataFrame(columns=cols)
+    g = df.groupby(df["充电桩型号"].fillna("未知").astype(str), dropna=False).size()
+    g = g.sort_values(ascending=False)
+    return pd.DataFrame(
+        {
+            "设备型号": g.index.tolist(),
+            "装机量": g.values.astype(int).tolist(),
+        }
+    )
+
+
+def sheet_ev_private() -> pd.DataFrame:
+    """车企私桩榜：整表占位（仅表头）。"""
+    return pd.DataFrame(columns=["车企名称", "私桩安装量", "占比", "环比增速"])
+
+
+def get_ranking_workbook_tables(
+    df: pd.DataFrame, for_pile: bool = True
+) -> List[Tuple[str, pd.DataFrame]]:
+    """[(Sheet 名, DataFrame), ...]，顺序固定。"""
+    return [
+        ("市场份额榜", sheet_market_share(df)),
+        ("设施销量榜", sheet_facility_sales(df)),
+        ("城市榜Top10", sheet_city_top10(df)),
+        ("星级场站榜", sheet_star_station(df)),
+        ("型号榜", sheet_model_rank(df, for_pile)),
+        ("车企私桩榜", sheet_ev_private()),
+    ]
+
+
+def write_ranking_workbook_bytes(df: pd.DataFrame, for_pile: bool = True) -> BytesIO:
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        for sheet_name, tbl in get_ranking_workbook_tables(df, for_pile=for_pile):
+            tbl.to_excel(writer, sheet_name=sheet_name[:31], index=False)
+    buf.seek(0)
+    return buf
+
+
+def get_all_ranking_tables(
+    df: pd.DataFrame, for_pile: bool = True
+) -> List[Tuple[str, str, pd.DataFrame]]:
+    """
+    兼容旧签名：返回 [(板块, 标题, DataFrame), ...]。
+    标题与 Sheet 名一致，便于 UI 下拉。
+    """
+    out: List[Tuple[str, str, pd.DataFrame]] = []
+    for sheet_name, tbl in get_ranking_workbook_tables(df, for_pile=for_pile):
+        out.append(("排行榜", sheet_name, tbl))
     return out
 
 
-def facility_sales_top_placeholder() -> pd.DataFrame:
-    """1.2 设施销量榜：占位，缺少历史月度数据。"""
-    return pd.DataFrame(columns=["排名", "运营商", "设施总量", "备注"])
+# 以下保留名称供外部或测试引用（实现已迁移至 sheet_*）
+def market_share_top(df: pd.DataFrame, for_pile: bool = True, top_n: int = 10) -> pd.DataFrame:
+    """已弃用：请用 sheet_market_share（全量）。"""
+    return sheet_market_share(df)
 
 
 def city_top(df: pd.DataFrame, for_pile: bool = True, top_n: int = 10) -> pd.DataFrame:
-    """1.3 城市榜 Top N：排名、城市、设施总量、全国占比、环比增速（占位）。充电桩数量用序号计数。"""
-    city_col = _city_col(df)
-    if city_col is None:
-        return pd.DataFrame(columns=["排名", "城市", "设施总量", "全国占比", "环比增速"])
-    df_ = df.copy()
-    df_["_city_grp_"] = df_[city_col].fillna("未知")
-    agg = agg_pile_count(df_, "_city_grp_", for_pile)
-    if agg.empty:
-        return pd.DataFrame(columns=["排名", "城市", "设施总量", "全国占比", "环比增速"])
-    total = agg.sum()
-    agg = agg.sort_values(ascending=False).head(top_n)
-    out = pd.DataFrame({
-        "排名": range(1, len(agg) + 1),
-        "城市": agg.index.astype(str).tolist(),
-        "设施总量": agg.values.tolist(),
-        "全国占比": [f"{(v / total * 100):.1f}%" for v in agg.values],
-        "环比增速": ["—"] * len(agg),
-    })
-    return out
-
-
-def star_station_placeholder() -> pd.DataFrame:
-    """1.4 星级场站榜：占位，缺少星级评分字段。"""
-    return pd.DataFrame(columns=["排名", "星级", "设施总量", "备注"])
+    """已弃用：请用 sheet_city_top10。"""
+    return sheet_city_top10(df)
 
 
 def model_rank_top(df: pd.DataFrame, for_pile: bool = True, top_n: int = 10) -> pd.DataFrame:
-    """1.5 型号榜：设备型号、装机量、市场占比、主要生产厂商。仅桩表；充电桩数量用序号计数。"""
-    if not for_pile:
-        return pd.DataFrame(columns=["排名", "设备型号", "装机量", "市场占比", "主要生产厂商"])
-    if "充电桩型号" not in df.columns:
-        return pd.DataFrame(columns=["排名", "设备型号", "装机量", "市场占比", "主要生产厂商"])
-    pc = pile_count_col(df, True)
-    if pc is None:
-        agg = df.groupby(df["充电桩型号"].fillna("未知"), dropna=False).size()
-    else:
-        agg = df.groupby(df["充电桩型号"].fillna("未知"), dropna=False)[pc].count()
-    total = agg.sum()
-    agg = agg.sort_values(ascending=False).head(top_n)
-    manufacturers = []
-    if "充电桩生产厂商名称" in df.columns:
-        for m in agg.index:
-            sub = df[df["充电桩型号"].fillna("未知") == m]
-            manufacturers.append(sub["充电桩生产厂商名称"].mode().iloc[0] if not sub.empty and sub["充电桩生产厂商名称"].notna().any() else "—")
-    else:
-        manufacturers = ["—"] * len(agg)
-    out = pd.DataFrame({
-        "排名": range(1, len(agg) + 1),
-        "设备型号": agg.index.astype(str).tolist(),
-        "装机量": agg.values.tolist(),
-        "市场占比": [f"{(v / total * 100):.1f}%" for v in agg.values],
-        "主要生产厂商": manufacturers,
-    })
-    return out
+    """已弃用：请用 sheet_model_rank（全量型号）。"""
+    return sheet_model_rank(df, for_pile)
+
+
+def facility_sales_top_placeholder() -> pd.DataFrame:
+    return sheet_facility_sales(pd.DataFrame())
+
+
+def star_station_placeholder() -> pd.DataFrame:
+    return sheet_star_station(pd.DataFrame())
 
 
 def ev_private_placeholder() -> pd.DataFrame:
-    """1.6 车企私桩榜：占位，无车企/个人私桩数据。"""
-    return pd.DataFrame(columns=["排名", "车企/品牌", "数量", "备注"])
-
-
-def get_all_ranking_tables(df: pd.DataFrame, for_pile: bool = True) -> List[Tuple[str, str, pd.DataFrame]]:
-    """返回 [(板块标题, 表标题, DataFrame), ...]。含 1.1～1.6。"""
-    tables: List[Tuple[str, str, pd.DataFrame]] = []
-    t1 = market_share_top(df, for_pile=for_pile)
-    tables.append(("排行榜", "1.1 存量市场份额榜 Top10", t1))
-    tables.append(("排行榜", "1.2 设施销量榜（占位）", facility_sales_top_placeholder()))
-    t3 = city_top(df, for_pile=for_pile)
-    tables.append(("排行榜", "1.3 城市榜 Top10", t3))
-    tables.append(("排行榜", "1.4 星级场站榜（占位）", star_station_placeholder()))
-    t5 = model_rank_top(df, for_pile=for_pile)
-    tables.append(("排行榜", "1.5 型号榜", t5))
-    tables.append(("排行榜", "1.6 车企私桩榜（占位）", ev_private_placeholder()))
-    return tables
+    return sheet_ev_private()

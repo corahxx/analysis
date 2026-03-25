@@ -28,3 +28,23 @@ def ratio_provinces_table(df: pd.DataFrame, for_pile: bool = True) -> pd.DataFra
         "充电桩": agg.values.tolist(),
         "评价": ["—"] * len(agg),
     })
+
+
+def ratio_vehicle_pile_product_table(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    车桩比产品表（标准列）：省份、新能源车保有量、公共充电设施数量、车桩比、评价。
+    省份分组用「省份_中文」，否则「省份」。
+    公共充电设施数量 = 各省数据条数（groupby 后 size）。
+    保有量、车桩比、评价暂空（空字符串占位）。
+    """
+    prov_col = "省份_中文" if "省份_中文" in df.columns else "省份" if "省份" in df.columns else None
+    empty_cols = ["省份", "新能源车保有量", "公共充电设施数量", "车桩比", "评价"]
+    if prov_col is None:
+        return pd.DataFrame(columns=empty_cols)
+    grp = df.groupby(df[prov_col].fillna("未知").astype(str), dropna=False).size().reset_index(name="公共充电设施数量")
+    grp = grp.rename(columns={prov_col: "省份"})
+    grp["新能源车保有量"] = ""
+    grp["车桩比"] = ""
+    grp["评价"] = ""
+    grp = grp.sort_values("公共充电设施数量", ascending=False).reset_index(drop=True)
+    return grp[["省份", "新能源车保有量", "公共充电设施数量", "车桩比", "评价"]]
