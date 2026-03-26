@@ -1,4 +1,4 @@
-# app.py - Analysis 系统：侧栏导航（入库 / 标准化数据产品）
+# app.py - Analysis 系统：侧栏多模块（入库、标准化数据产品多条线）
 
 import os
 import sys
@@ -9,6 +9,7 @@ import streamlit as st
 import pandas as pd
 
 from config import DB_CONFIG
+from db_helper import DEFAULT_PG_DATABASE, DEFAULT_PG_PASSWORD
 
 # 确保项目根目录在 path 中，以便 handlers 作为包导入（相对导入 .data_utils 才能工作）
 _app_dir = os.path.dirname(os.path.abspath(__file__))
@@ -192,6 +193,147 @@ def _show_asset_image(filename: str, placeholder_html: str) -> None:
         st.markdown(placeholder_html, unsafe_allow_html=True)
 
 
+def _render_standard00_transform_page() -> None:
+    """侧栏独立页：仅依赖 00 表上传，不要求清洗明细表或库表。"""
+    st.markdown(_banner_with_background("product-banner.png"), unsafe_allow_html=True)
+    st.markdown(
+        '<p style="color:#546e7a;font-size:0.95rem;font-weight:500;margin:1.5rem 0 1rem 0;letter-spacing:0.02em;">标准化数据产品-由标准00表生成</p>',
+        unsafe_allow_html=True,
+    )
+    export_date = _export_date()
+    st.caption(
+        "上传文件名须含「00表标准化-系统输入-YYMM」（如 …-2602.xlsx 表示 2026 年 2 月）。"
+        "在下方勾选要导出的月份，每月各生成一套 01～07（一个 ZIP）。"
+        "环比需自然月上一期也已上传，否则环比列为空。详见 docs/由标准00表转化_功能说明.md。"
+    )
+    std00_files = st.file_uploader(
+        "选择 00 表（可多选 xlsx/xls）",
+        type=["xlsx", "xls"],
+        accept_multiple_files=True,
+        key="std00_uploader",
+    )
+    if not std00_files:
+        st.info("请上传 00 表后，下方将显示可勾选的统计月份。")
+        return
+    _sig = tuple(sorted(str(getattr(f, "name", "") or "") for f in std00_files))
+    try:
+        from handlers.standard00_transform import (
+            build_standard00_multi_month_zip_bytes,
+            ingest_uploaded_workbooks,
+            list_sorted_periods,
+        )
+
+        _snaps, _warns = ingest_uploaded_workbooks(list(std00_files))
+        for _w in _warns:
+            st.warning(_w)
+        _pers = list_sorted_periods(_snaps)
+        if not _pers:
+            st.info("没有成功解析的 00 表，请检查文件名是否含 00表标准化-系统输入-YYMM。")
+            return
+        if st.session_state.get("_std00_ck_reset_sig") != _sig:
+            for _k in list(st.session_state.keys()):
+                if isinstance(_k, str) and _k.startswith("std00_month_ck_"):
+                    del st.session_state[_k]
+            st.session_state["_std00_ck_reset_sig"] = _sig
+        st.markdown("##### 选择要生成七表的月份")
+        st.caption("勾选需要导出的统计期（每月一套 01～07）；默认全部勾选。")
+        _ncol = min(4, max(1, len(_pers)))
+        _selected: list = []
+        for _i, (_y, _m) in enumerate(_pers):
+            if _i % _ncol == 0:
+                _row_cols = st.columns(_ncol)
+            _ck_key = f"std00_month_ck_{_y}_{_m}"
+            if _ck_key not in st.session_state:
+                st.session_state[_ck_key] = True
+            with _row_cols[_i % _ncol]:
+                _lab = f"{_y}年{_m:02d}月（{_y % 100:02d}{_m:02d}）"
+                if st.checkbox(_lab, key=_ck_key):
+                    _selected.append((_y, _m))
+        _targets_tuple = tuple(sorted(_selected))
+        _clear_sig = (_sig, _targets_tuple)
+        if st.session_state.get("_std00_clear_sig") != _clear_sig:
+            st.session_state.pop("std00_zip_bytes", None)
+            st.session_state.pop("std00_zip_name", None)
+            st.session_state["_std00_clear_sig"] = _clear_sig
+        if st.button("生成七表 ZIP（由 00 表）", key="std00_build_btn"):
+            if not _selected:
+                st.error("请至少勾选一个月份。")
+            else:
+                with st.spinner(f"正在生成 {len(_selected)} 个月 × 七表…"):
+                    _zbuf = build_standard00_multi_month_zip_bytes(
+                        _snaps, _selected, export_date
+                    )
+                if _zbuf and _zbuf.getvalue():
+                    st.session_state["std00_zip_bytes"] = _zbuf.getvalue()
+                    _yy = "-".join(
+                        f"{(y % 100):02d}{m:02d}" for y, m in sorted(_selected)
+                    )
+                    st.session_state["std00_zip_name"] = (
+                        f"标准化数据产品_00表转化_{_yy}_{export_date}.zip"
+                    )
+                else:
+                    st.error("生成失败，请检查所选月份是否均已成功解析。")
+        if st.session_state.get("std00_zip_bytes"):
+            st.download_button(
+                "下载 00 表转化 · 七表 ZIP",
+                data=st.session_state["std00_zip_bytes"],
+                file_name=st.session_state.get(
+                    "std00_zip_name",
+                    f"标准化数据产品_00表转化_{export_date}.zip",
+                ),
+                mime="application/zip",
+                key="std00_dl_zip",
+            )
+    except Exception as e:
+        st.error(f"00 表处理出错：{e}")
+
+
+def _render_raw_to_standard00_page() -> None:
+    """原始月度汇总表 → 标准 00 表（系统输入）。"""
+    st.markdown(_banner_with_background("product-banner.png"), unsafe_allow_html=True)
+    st.markdown(
+        '<p style="color:#546e7a;font-size:0.95rem;font-weight:500;margin:1.5rem 0 1rem 0;letter-spacing:0.02em;">'
+        "标准化数据产品-由原始表生成标准00表</p>",
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "上传能源局等「月度原始汇总」xlsx（文件名中须含六位年月，如 202602）。"
+        "将生成与「00表标准化-系统输入-YYMM」相同结构的 workbook，"
+        "可直接用于侧栏「标准化数据产品-由标准00表生成」。"
+        "当前按《00、充换电数据梳理图表-*-能源局》类 Sheet 名解析；缺表时对应 Sheet 为空。"
+    )
+    up = st.file_uploader("选择原始汇总表（xlsx）", type=["xlsx"], key="raw00_upload")
+    if up is not None:
+        _sig = (str(getattr(up, "name", "")), getattr(up, "size", 0))
+        if st.session_state.get("_raw00_sig") != _sig:
+            st.session_state.pop("raw00_xlsx_bytes", None)
+            st.session_state.pop("raw00_out_name", None)
+            st.session_state["_raw00_sig"] = _sig
+        if st.button("生成标准 00 表", key="raw00_build_btn"):
+            try:
+                from handlers.raw_to_standard00 import build_standard00_workbook_from_uploaded
+
+                with st.spinner("正在解析原始表并生成标准 00 表…"):
+                    _buf, _name = build_standard00_workbook_from_uploaded(up)
+                if _buf and _buf.getvalue():
+                    st.session_state["raw00_xlsx_bytes"] = _buf.getvalue()
+                    st.session_state["raw00_out_name"] = _name
+                else:
+                    st.error("生成失败。")
+            except Exception as e:
+                st.error(f"生成失败：{e}")
+        if st.session_state.get("raw00_xlsx_bytes"):
+            st.download_button(
+                "下载标准 00 表",
+                data=st.session_state["raw00_xlsx_bytes"],
+                file_name=st.session_state.get("raw00_out_name", "00表标准化-系统输入.xlsx"),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="raw00_dl_btn",
+            )
+    else:
+        st.info("请上传原始汇总 xlsx。")
+
+
 # 必备列（与 merge 规范一致，至少具备关键列即可入库）
 PILE_KEY_COLS = ["充电桩编号", "所属充电站编号"]
 STATION_KEY_COLS = ["所属充电站编号", "充电站内部编号"]
@@ -225,17 +367,31 @@ SIDEBAR_CSS = """
 """
 st.markdown(SIDEBAR_CSS, unsafe_allow_html=True)
 
-# ---------- 侧栏导航：1. 入库  2. 标准化数据产品 ----------
+# ---------- 侧栏导航 ----------
+_NAV_OPTIONS = [
+    "入库",
+    "标准化数据产品-由数据库生成",
+    "标准化数据产品-由原始表生成标准00表",
+    "标准化数据产品-由标准00表生成",
+]
+_LEGACY_VIEW_MODE = {
+    "标准化数据产品": "标准化数据产品-由数据库生成",
+    "由标准00表转化": "标准化数据产品-由标准00表生成",
+}
 if "view_mode" not in st.session_state:
+    st.session_state.view_mode = "入库"
+if st.session_state.view_mode in _LEGACY_VIEW_MODE:
+    st.session_state.view_mode = _LEGACY_VIEW_MODE[st.session_state.view_mode]
+if st.session_state.view_mode not in _NAV_OPTIONS:
     st.session_state.view_mode = "入库"
 
 with st.sidebar:
     st.markdown('<div class="sidebar-title-block">Analysis 数据分析系统</div>', unsafe_allow_html=True)
     view = st.radio(
         "功能",
-        options=["入库", "标准化数据产品"],
-        index=0 if st.session_state.view_mode == "入库" else 1,
-        key="sidebar_nav",
+        options=_NAV_OPTIONS,
+        index=_NAV_OPTIONS.index(st.session_state.view_mode),
+        key="sidebar_nav_v3",
         label_visibility="collapsed",
     )
     st.session_state.view_mode = view
@@ -274,14 +430,24 @@ if st.session_state.view_mode == "入库":
             pg_host = st.text_input("Host", value=str(_pc0.get("host", "localhost")), key="pg_host_import")
             pg_port = st.text_input("Port", value=str(_pc0.get("port", "5432")), key="pg_port_import")
             pg_user = st.text_input("User", value=str(_pc0.get("user", "postgres")), key="pg_user_import")
-            pg_password = st.text_input("Password", type="password", key="pg_password_import", placeholder="输入密码")
-            pg_database = st.text_input("Database", value=str(_pc0.get("database", "postgres")), key="pg_database_import")
+            pg_password = st.text_input(
+                "Password",
+                type="password",
+                value=str(_pc0.get("password", DEFAULT_PG_PASSWORD)),
+                key="pg_password_import",
+                placeholder="输入密码",
+            )
+            pg_database = st.text_input(
+                "Database",
+                value=str(_pc0.get("database", DEFAULT_PG_DATABASE)),
+                key="pg_database_import",
+            )
         st.session_state["pg_config"] = {
             "host": pg_host or "localhost",
             "port": int(pg_port or "5432"),
             "user": pg_user or "postgres",
-            "password": pg_password or "",
-            "database": pg_database or "postgres",
+            "password": pg_password or DEFAULT_PG_PASSWORD,
+            "database": pg_database or DEFAULT_PG_DATABASE,
         }
 
     if st.button("测试连接", key="test_conn_import"):
@@ -293,46 +459,48 @@ if st.session_state.view_mode == "入库":
         else:
             st.error("连接失败：" + msg)
 
+    _backend = st.session_state.get("db_backend", "mysql")
+    _pg_config = st.session_state.get("pg_config") if _backend == "postgresql" else None
+    _pg_schema_sel = None
+    if _backend == "postgresql" and _pg_config:
+        from db_helper import list_pg_schemas
+        schemas, s_err = list_pg_schemas(_pg_config)
+        if s_err:
+            st.error("获取 Schema 列表失败：" + s_err)
+        elif not schemas:
+            st.warning("未找到可用的 Schema。")
+        else:
+            _def = schemas.index("public") if "public" in schemas else 0
+            st.selectbox(
+                "Schema (PostgreSQL)",
+                options=schemas,
+                index=_def,
+                key="pg_schema_import",
+            )
+            _pg_schema_sel = st.session_state.get("pg_schema_import")
+
     st.markdown("### 入库方式")
     import_mode = st.radio(
         "选择入库方式",
-        options=["已有表追加数据", "新增表导入数据"],
+        options=["已有表追加数据", "新增表（空白）", "新增表（复制其他表结构）"],
         index=0,
-        key="import_mode",
+        key="import_mode_v2",
         horizontal=True,
     )
 
-    _backend = st.session_state.get("db_backend", "mysql")
-    _pg_config = st.session_state.get("pg_config") if _backend == "postgresql" else None
-
     target_table = ""
+    structure_source_table = ""
+    try:
+        from db_helper import list_tables_with_status
+        tables, db_error = list_tables_with_status(
+            backend=_backend,
+            pg_config=_pg_config,
+            pg_schema=_pg_schema_sel,
+        )
+    except Exception as e:
+        tables, db_error = [], str(e)[:500]
+
     if import_mode == "已有表追加数据":
-        _pg_schema_sel = None
-        if _backend == "postgresql" and _pg_config:
-            from db_helper import list_pg_schemas
-            schemas, s_err = list_pg_schemas(_pg_config)
-            if s_err:
-                st.error("获取 Schema 列表失败：" + s_err)
-            elif not schemas:
-                st.warning("未找到可用的 Schema。")
-            else:
-                _def = schemas.index("public") if "public" in schemas else 0
-                st.selectbox(
-                    "Schema (PostgreSQL)",
-                    options=schemas,
-                    index=_def,
-                    key="pg_schema",
-                )
-                _pg_schema_sel = st.session_state.get("pg_schema")
-        try:
-            from db_helper import list_tables_with_status
-            tables, db_error = list_tables_with_status(
-                backend=_backend,
-                pg_config=_pg_config,
-                pg_schema=_pg_schema_sel,
-            )
-        except Exception as e:
-            tables, db_error = [], str(e)[:500]
         if db_error:
             st.error("连接失败：" + db_error)
         elif _backend == "postgresql" and _pg_config and not _pg_schema_sel:
@@ -341,13 +509,33 @@ if st.session_state.view_mode == "入库":
             st.warning("连接成功，但当前 Schema 下无表。")
         else:
             target_table = st.selectbox("选择目标表", options=tables, key="import_target_table")
-    else:
+    elif import_mode == "新增表（空白）":
         new_table_name = st.text_input(
             "新表名称（可选，留空则按日期/类型自动生成）",
             key="new_table_name",
             value="",
         )
         target_table = new_table_name.strip()
+    else:
+        new_table_name = st.text_input(
+            "新表名称（必填）",
+            key="new_table_name_copy",
+            value="",
+            placeholder="将创建该名称的表并导入数据",
+        )
+        target_table = new_table_name.strip()
+        if db_error:
+            st.error("连接失败：" + db_error)
+        elif _backend == "postgresql" and _pg_config and not _pg_schema_sel:
+            st.info("请先选择 Schema。")
+        elif not tables:
+            st.warning("当前 Schema 下无表，无法复制结构。")
+        else:
+            structure_source_table = st.selectbox(
+                "复制结构来源表（新建表将与其列、约束类型一致）",
+                options=tables,
+                key="import_structure_source_table",
+            )
 
     table_type_import = st.selectbox(
         "表类型",
@@ -420,14 +608,16 @@ if st.session_state.view_mode == "入库":
                 final_name = other_table_name.strip()
                 _be = st.session_state.get("db_backend", "mysql")
                 _pg = st.session_state.get("pg_config") if _be == "postgresql" else None
+                _pg_s_other = st.session_state.get("pg_schema_import") if _be == "postgresql" else None
                 engine = get_connection(backend=_be, pg_config=_pg)
                 try:
-                    created = create_table_from_schema(engine, final_name, schema)
+                    created = create_table_from_schema(
+                        engine, final_name, schema, pg_schema=_pg_s_other
+                    )
                     if created:
                         st.success(f"已创建新表：{final_name}")
                     else:
                         st.warning(f"表 {final_name} 已存在，将追加数据。")
-                    _pg_s_other = st.session_state.get("pg_schema") if _be == "postgresql" else None
                     success, fail, errors = insert_df_to_table(
                         engine, final_name, df_other_full, pg_schema=_pg_s_other
                     )
@@ -447,6 +637,12 @@ if st.session_state.view_mode == "入库":
             st.warning("请先选择清洗后文件。")
         elif import_mode == "已有表追加数据" and not target_table:
             st.warning("请选择目标表。")
+        elif import_mode == "新增表（复制其他表结构）" and (
+            not target_table or not structure_source_table
+        ):
+            st.warning("请填写新表名称并选择要复制的来源表。")
+        elif _backend == "postgresql" and _pg_config and not _pg_schema_sel:
+            st.warning("使用 PostgreSQL 时请先在上方选择 Schema。")
         else:
             try:
                 if import_file.name.lower().endswith(".csv"):
@@ -463,40 +659,75 @@ if st.session_state.view_mode == "入库":
                 if not ok:
                     st.error(msg)
                 else:
-                    from db_helper import get_connection, create_table_from_df, insert_df_to_table
+                    from db_helper import (
+                        create_table_from_df,
+                        create_table_like,
+                        get_connection,
+                        import_dataframe_via_staging,
+                    )
 
                     _be = st.session_state.get("db_backend", "mysql")
                     _pg = st.session_state.get("pg_config") if _be == "postgresql" else None
                     engine = get_connection(backend=_be, pg_config=_pg)
+                    _pg_s = _pg_schema_sel if _be == "postgresql" else None
                     final_table = target_table
-                    if import_mode == "新增表导入数据" and not final_table:
+                    if import_mode == "新增表（空白）" and not final_table:
                         suffix = date.today().strftime("%Y%m%d")
                         final_table = f"pile_{suffix}" if for_pile else f"station_{suffix}"
 
-                    created = False
-                    if import_mode == "新增表导入数据":
-                        try:
-                            created = create_table_from_df(engine, final_table, df_import)
+                    try:
+                        if import_mode == "新增表（空白）":
+                            created = create_table_from_df(
+                                engine, final_table, df_import, pg_schema=_pg_s
+                            )
                             if created:
                                 st.success(f"已创建新表：{final_table}")
-                        except Exception as e:
-                            st.error(f"建表失败：{e}")
-
-                    try:
-                        _pg_s = st.session_state.get("pg_schema") if _be == "postgresql" else None
-                        success, fail, errors = insert_df_to_table(
-                            engine, final_table, df_import, pg_schema=_pg_s
-                        )
-                        st.metric("成功", success)
-                        st.metric("失败", fail)
-                        if errors:
-                            with st.expander("错误详情（前若干条）"):
-                                for err in errors:
-                                    st.code(err)
+                            else:
+                                st.info(f"表 {final_table} 已存在，将向其中追加（经临时表校验后写入）。")
+                        elif import_mode == "新增表（复制其他表结构）":
+                            created = create_table_like(
+                                engine,
+                                final_table,
+                                structure_source_table,
+                                pg_schema=_pg_s,
+                            )
+                            if created:
+                                st.success(
+                                    f"已按「{structure_source_table}」结构创建新表：{final_table}"
+                                )
+                            else:
+                                st.info(
+                                    f"表 {final_table} 已存在，将按现有结构经临时表校验后写入。"
+                                )
                     except Exception as e:
-                        st.error(f"写入失败：{e}")
-                        st.metric("成功", 0)
-                        st.metric("失败", len(df_import))
+                        st.error(f"建表失败：{e}")
+                        df_import = None
+
+                    if df_import is not None:
+                        ok_imp, msg_imp, n_staged, errs_imp = import_dataframe_via_staging(
+                            engine,
+                            final_table,
+                            df_import,
+                            pg_schema=_pg_s,
+                        )
+                        if ok_imp:
+                            st.success(msg_imp)
+                            st.metric("成功写入临时表行数", n_staged)
+                            st.metric("失败", 0)
+                        else:
+                            st.error(msg_imp)
+                            st.metric("临时表校验通过行数", 0)
+                            st.metric("失败", len(df_import))
+                            if errs_imp:
+                                with st.expander("错误详情（前若干条）"):
+                                    for err in errs_imp:
+                                        st.code(err)
+
+elif st.session_state.view_mode == "标准化数据产品-由标准00表生成":
+    _render_standard00_transform_page()
+
+elif st.session_state.view_mode == "标准化数据产品-由原始表生成标准00表":
+    _render_raw_to_standard00_page()
 
 else:
     # ========== 标准化数据产品页：顶部图块 + 标题（图下，与 ### 区分） ==========
@@ -559,14 +790,23 @@ else:
                 pg_host_p = st.text_input("Host", value=str(_pc.get("host", "localhost")), key="pg_host_product")
                 pg_port_p = st.text_input("Port", value=str(_pc.get("port", "5432")), key="pg_port_product")
                 pg_user_p = st.text_input("User", value=str(_pc.get("user", "postgres")), key="pg_user_product")
-                pg_password_p = st.text_input("Password", type="password", value=str(_pc.get("password", "")), key="pg_password_product")
-                pg_database_p = st.text_input("Database", value=str(_pc.get("database", "postgres")), key="pg_database_product")
+                pg_password_p = st.text_input(
+                    "Password",
+                    type="password",
+                    value=str(_pc.get("password", DEFAULT_PG_PASSWORD)),
+                    key="pg_password_product",
+                )
+                pg_database_p = st.text_input(
+                    "Database",
+                    value=str(_pc.get("database", DEFAULT_PG_DATABASE)),
+                    key="pg_database_product",
+                )
             st.session_state["pg_config"] = {
                 "host": pg_host_p or "localhost",
                 "port": int(pg_port_p or "5432"),
                 "user": pg_user_p or "postgres",
-                "password": pg_password_p or "",
-                "database": pg_database_p or "postgres",
+                "password": pg_password_p or DEFAULT_PG_PASSWORD,
+                "database": pg_database_p or DEFAULT_PG_DATABASE,
             }
         _pg_schema_product = None
         if backend_product == "postgresql" and st.session_state.get("pg_config"):

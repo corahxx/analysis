@@ -6,6 +6,8 @@ from typing import Optional
 
 import pandas as pd
 
+from handlers.highway_template import build_highway_workbook_bytes
+
 
 def build_seven_products_zip_bytes(
     df,
@@ -41,11 +43,8 @@ def build_seven_products_zip_bytes(
             except Exception:
                 pass
 
-        # 2 高速公路（占位说明）
-        hw = BytesIO()
-        pd.DataFrame({"说明": ["高速公路产品待业务定义，此文件为占位。"]}).to_excel(
-            hw, index=False, engine="openpyxl"
-        )
+        # 2 高速公路（与业务模板一致的双 Sheet 结构；无省份指标时空表）
+        hw = build_highway_workbook_bytes(None)
         _add_xlsx("02_高速公路_占位.xlsx", hw.getvalue())
 
         # 3 功率段分布
