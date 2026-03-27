@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import re
 import zipfile
 from io import BytesIO
@@ -10,6 +9,10 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
+from handlers.data_utils import (
+    dataframe_cells_percent_to_decimal_ratio,
+    format_share_ratios_4dp_max_remainder,
+)
 from handlers.highway_template import build_highway_workbook_bytes
 from handlers.national_handler import NATIONAL_OVERVIEW_COLUMNS, NATIONAL_WORKBOOK_SHEET_TITLES
 from handlers.operator_handler import OPERATOR_PRODUCT_COLUMNS, OPERATOR_WORKBOOK_SHEET_TITLES
@@ -97,34 +100,48 @@ def _num(v) -> Optional[float]:
         return None
 
 
+# 由标准 00 表生成的产品中，无法产出数值时原为空单元格，统一写反斜杠（不替换原本为 0 的数）
+STANDARD00_MISSING_CELL = "\\"
+
+# 仅作占位、无数值含义的横杠（半角连字符、长/短破折号、全角减号等）
+_STANDARD00_DASH_ONLY_PLACEHOLDERS = frozenset(("-", "—", "–", "－"))
+
+
+def _standard00_cell_is_missing(v: object) -> bool:
+    if v is None:
+        return True
+    try:
+        if pd.isna(v):
+            return True
+    except (TypeError, ValueError):
+        pass
+    if isinstance(v, str):
+        t = v.strip()
+        if t == "":
+            return True
+        if t in _STANDARD00_DASH_ONLY_PLACEHOLDERS:
+            return True
+    return False
+
+
+def standard00_fill_missing_cells(df: pd.DataFrame) -> pd.DataFrame:
+    """将 None / NaN / 空字符串 / 仅横杠占位（如 -、—）单元格替换为 '\\'；数值 0 与字符串 '0.0000' 等保持不变。"""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    for c in out.columns:
+        out[c] = out[c].map(
+            lambda x: STANDARD00_MISSING_CELL if _standard00_cell_is_missing(x) else x
+        )
+    return out
+
+
 def format_pct_share_strings_two_dp(values: Sequence[float]) -> List[str]:
     """
-    占比字符串：两位小数 +「%」，同一批数值采用最大余额法分配，
-    使各字符串解析后的百分点之和为 100.00（避免逐项四舍五入导致合计漂移）。
+    占比：写为 0～1 的小数字符串，保留四位；同一批在万分之一上最大余额法分配，
+    使各值之和为 1.0000（避免逐项四舍五入导致合计漂移）。
     """
-    vals = [float(v) for v in values]
-    n = len(vals)
-    if n == 0:
-        return []
-    total = sum(vals)
-    if total <= 0:
-        return ["0.00%"] * n
-    exact_bp = [v / total * 10000.0 for v in vals]
-    floor_bp = [math.floor(x + 1e-9) for x in exact_bp]
-    rem = int(round(10000 - sum(floor_bp)))
-    frac = [exact_bp[i] - floor_bp[i] for i in range(n)]
-    order_desc = sorted(range(n), key=lambda i: (-frac[i], -vals[i], i))
-    adj = list(floor_bp)
-    if rem > 0:
-        for i in range(rem):
-            adj[order_desc[i % n]] += 1
-    elif rem < 0:
-        order_asc = sorted(range(n), key=lambda i: (frac[i], vals[i], i))
-        for i in range(-rem):
-            idx = order_asc[i % n]
-            if adj[idx] > 0:
-                adj[idx] -= 1
-    return [f"{x / 100:.2f}%" for x in adj]
+    return format_share_ratios_4dp_max_remainder(values)
 
 
 def _city_display_label(v) -> Optional[str]:
@@ -135,15 +152,16 @@ def _city_display_label(v) -> Optional[str]:
 
 
 def _fmt_mom_growth(curr: Optional[float], prev: Optional[float]) -> str:
+    """环比增速：(本期−上期)/上期，以小数表示保留四位；无上期或本期为空则空串。"""
     if curr is None:
         return ""
     if prev is None:
         return ""
     if prev == 0 and curr == 0:
-        return "0.0%"
+        return "0.0000"
     if prev == 0:
         return "—"
-    return f"{((curr - prev) / prev * 100):.1f}%"
+    return f"{((curr - prev) / prev):.4f}"
 
 
 def _fmt_mom_delta(curr: Optional[float], prev: Optional[float]) -> str:
@@ -291,18 +309,26 @@ def build_national_workbook(
             pcts = format_pct_share_strings_two_dp(vals)
             recs = []
             for (k, v), pct in zip(rows, pcts):
+                qty_out = v
+                if sheet_title == "充电电量":
+                    qty_out = v / 10000.0
+                    if abs(qty_out - round(qty_out)) < 1e-9:
+                        qty_out = int(round(qty_out))
+                else:
+                    if abs(v - round(v)) < 1e-9:
+                        qty_out = int(round(v))
                 recs.append(
                     {
                         "省份": k,
-                        "数量": int(v) if abs(v - round(v)) < 1e-9 else v,
+                        "数量": qty_out,
                         "全国占比": pct,
                         "环比增速": _fmt_mom_growth(v, pmap.get(k)),
                     }
                 )
             recs.sort(key=lambda x: x["数量"] if isinstance(x["数量"], (int, float)) else 0, reverse=True)
-            pd.DataFrame(recs, columns=NATIONAL_OVERVIEW_COLUMNS).to_excel(
-                writer, sheet_name=sheet_title[:31], index=False
-            )
+            standard00_fill_missing_cells(
+                pd.DataFrame(recs, columns=NATIONAL_OVERVIEW_COLUMNS)
+            ).to_excel(writer, sheet_name=sheet_title[:31], index=False)
     buf.seek(0)
     return buf
 
@@ -342,13 +368,19 @@ def build_provincial_workbook(
                 pc = _pick_col(prov_prev, cands)
                 if pc is not None:
                     pv = _num(prev_row.get(pc))
+            # 充电电量：展示与环比均为原值/10000；换电电量等其它维度不改
+            scale = 10000.0 if dim == "充电电量" else 1.0
             if cv is None:
                 vals.append("")
-            elif abs(cv - round(cv)) < 1e-9:
-                vals.append(str(int(round(cv))))
+                moms.append("")
             else:
-                vals.append(str(cv))
-            moms.append(_fmt_mom_delta(cv, pv) if cv is not None else "")
+                disp = cv / scale
+                if abs(disp - round(disp)) < 1e-9:
+                    vals.append(str(int(round(disp))))
+                else:
+                    vals.append(str(disp))
+                pv_disp = (pv / scale) if pv is not None else None
+                moms.append(_fmt_mom_delta(disp, pv_disp))
         tbl = pd.DataFrame(
             {
                 "数据维度": list(PROVINCE_DIMENSION_ROWS),
@@ -362,14 +394,16 @@ def build_provincial_workbook(
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         for sname, tbl in pairs:
-            tbl.to_excel(writer, sheet_name=sname[:31], index=False)
+            standard00_fill_missing_cells(tbl).to_excel(
+                writer, sheet_name=sname[:31], index=False
+            )
     buf.seek(0)
     return buf
 
 
 def build_ratio_workbook(cur: Dict[str, pd.DataFrame]) -> BytesIO:
     prov = _province_df(cur)
-    empty_cols = ["省份", "新能源车保有量", "公共充电设施数量", "车桩比", "评价"]
+    empty_cols = ["省份", "新能源车保有量", "公共充电设施数量", "车桩比"]
     if prov is None or "省份" not in prov.columns:
         buf = BytesIO()
         pd.DataFrame(columns=empty_cols).to_excel(buf, index=False, engine="openpyxl")
@@ -393,40 +427,59 @@ def build_ratio_workbook(cur: Dict[str, pd.DataFrame]) -> BytesIO:
                 "新能源车保有量": "" if veh is None else (int(veh) if abs(veh - round(veh)) < 1e-9 else veh),
                 "公共充电设施数量": "" if fac is None else (int(fac) if abs(fac - round(fac)) < 1e-9 else fac),
                 "车桩比": ratio,
-                "评价": "",
             }
         )
     df = pd.DataFrame(rows, columns=empty_cols)
     df = df.sort_values("公共充电设施数量", ascending=False, na_position="last")
     buf = BytesIO()
-    df.to_excel(buf, index=False, engine="openpyxl")
+    standard00_fill_missing_cells(df).to_excel(buf, index=False, engine="openpyxl")
     buf.seek(0)
     return buf
 
 
-def build_power_workbook_placeholder(cur: Dict[str, pd.DataFrame]) -> BytesIO:
+def build_power_workbook_standard00(
+    cur: Dict[str, pd.DataFrame],
+    prev: Optional[Dict[str, pd.DataFrame]],
+) -> BytesIO:
+    """
+    00 表路径下无明细桩功率：各档数量为 0，占比写四位小数，环比为数量环比（与上月同省同档比）。
+    上月无该省时按 0 对比；无上期文件则环比列为空。
+    """
     prov = _province_df(cur)
     used: set = set()
-    names: List[str] = []
+    rows_meta: List[Tuple[str, str]] = []
     if prov is not None and "省份" in prov.columns:
         for _, r in prov.iterrows():
             p = str(r.get("省份", "")).strip()
             if p:
-                names.append(_sanitize_sheet_name(p, used))
-    if not names:
-        names = [_sanitize_sheet_name("全部", used)]
-    empty_tbl = pd.DataFrame(
-        {
-            "功率段": POWER_SEGMENT_LABELS,
-            "数量": [0] * len(POWER_SEGMENT_LABELS),
-            "占比": ["0.00%"] * len(POWER_SEGMENT_LABELS),
-            "环比": [""] * len(POWER_SEGMENT_LABELS),
-        }
-    )
+                rows_meta.append((_sanitize_sheet_name(p, used), p))
+    if not rows_meta:
+        used_empty: set = set()
+        rows_meta = [(_sanitize_sheet_name("全部", used_empty), "全部")]
+    zero_counts = [0] * len(POWER_SEGMENT_LABELS)
+    share_dec = format_pct_share_strings_two_dp([float(x) for x in zero_counts])
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        for sn in names:
-            empty_tbl.to_excel(writer, sheet_name=sn[:31], index=False)
+        for sn, pkey in rows_meta:
+            if prev is None:
+                mom = [""] * len(POWER_SEGMENT_LABELS)
+            else:
+                prev_c = [0] * len(POWER_SEGMENT_LABELS)
+                mom = [
+                    _fmt_mom_growth(float(c), float(pc))
+                    for c, pc in zip(zero_counts, prev_c)
+                ]
+            tbl = pd.DataFrame(
+                {
+                    "功率段": POWER_SEGMENT_LABELS,
+                    "数量": zero_counts,
+                    "占比": share_dec,
+                    "环比": mom,
+                }
+            )
+            standard00_fill_missing_cells(
+                dataframe_cells_percent_to_decimal_ratio(tbl)
+            ).to_excel(writer, sheet_name=sn[:31], index=False)
     buf.seek(0)
     return buf
 
@@ -527,11 +580,11 @@ def build_ranking_workbook(
                     continue
                 cvals.append((kk, v))
             cvals.sort(key=lambda x: -x[1])
+            national_total = sum(v for _, v in cvals)
             top = cvals[:10]
-            tvals = [v for _, v in top]
-            cpcts = format_pct_share_strings_two_dp(tvals)
             cr = []
-            for (kk, v), pct in zip(top, cpcts):
+            for kk, v in top:
+                pct = f"{(v / national_total):.4f}" if national_total > 0 else "0.0000"
                 cr.append(
                     {
                         "城市": kk,
@@ -570,8 +623,9 @@ def build_ranking_workbook(
     else:
         df_star = pd.DataFrame(columns=stcols)
 
-    # 型号榜
+    # 型号榜（排除占位型号，按装机量降序取前 10）
     mocols = ["设备型号", "装机量"]
+    _model_rank_skip = frozenset(("未知", "【未知】", "充电桩", "【充电桩】"))
     df_model = pd.DataFrame(columns=mocols)
     if "型号" in cur and not cur["型号"].empty:
         md = cur["型号"]
@@ -582,13 +636,14 @@ def build_ranking_workbook(
                 if k is None or (isinstance(k, float) and pd.isna(k)):
                     continue
                 k = str(k).strip()
-                if not k:
+                if not k or k in _model_rank_skip:
                     continue
                 v = _num(r.get("装机量"))
                 if v is None:
                     continue
                 mr.append((k, v))
             mr.sort(key=lambda x: -x[1])
+            mr = mr[:10]
             df_model = pd.DataFrame(
                 [
                     {
@@ -640,12 +695,24 @@ def build_ranking_workbook(
 
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df_ms.to_excel(writer, sheet_name="市场份额榜"[:31], index=False)
-        df_sales.to_excel(writer, sheet_name="设施销量榜"[:31], index=False)
-        df_city.to_excel(writer, sheet_name="城市榜Top10"[:31], index=False)
-        df_star.to_excel(writer, sheet_name="星级场站榜"[:31], index=False)
-        df_model.to_excel(writer, sheet_name="型号榜"[:31], index=False)
-        df_ev.to_excel(writer, sheet_name="车企私桩榜"[:31], index=False)
+        standard00_fill_missing_cells(df_ms).to_excel(
+            writer, sheet_name="市场份额榜"[:31], index=False
+        )
+        standard00_fill_missing_cells(df_sales).to_excel(
+            writer, sheet_name="设施销量榜"[:31], index=False
+        )
+        standard00_fill_missing_cells(df_city).to_excel(
+            writer, sheet_name="城市榜Top10"[:31], index=False
+        )
+        standard00_fill_missing_cells(df_star).to_excel(
+            writer, sheet_name="星级场站榜"[:31], index=False
+        )
+        standard00_fill_missing_cells(df_model).to_excel(
+            writer, sheet_name="型号榜"[:31], index=False
+        )
+        standard00_fill_missing_cells(df_ev).to_excel(
+            writer, sheet_name="车企私桩榜"[:31], index=False
+        )
     buf.seek(0)
     return buf
 
@@ -707,7 +774,7 @@ def build_operator_workbook(
             if sheet_title == "换电站":
                 df_sw = _swap_station_operator_table(cur, prev)
                 if not df_sw.empty:
-                    df_sw.to_excel(
+                    standard00_fill_missing_cells(df_sw).to_excel(
                         writer, sheet_name=sheet_title[:31], index=False
                     )
                     continue
@@ -746,9 +813,9 @@ def build_operator_workbook(
                 key=lambda x: x["数值"] if isinstance(x["数值"], (int, float)) else 0,
                 reverse=True,
             )
-            pd.DataFrame(recs, columns=OPERATOR_PRODUCT_COLUMNS).to_excel(
-                writer, sheet_name=sheet_title[:31], index=False
-            )
+            standard00_fill_missing_cells(
+                pd.DataFrame(recs, columns=OPERATOR_PRODUCT_COLUMNS)
+            ).to_excel(writer, sheet_name=sheet_title[:31], index=False)
     buf.seek(0)
     return buf
 
@@ -776,9 +843,11 @@ def _write_seven_standard00_into_zip(
     add("01_车桩比.xlsx", bio.getvalue())
     add(
         "02_高速公路_占位.xlsx",
-        build_highway_workbook_bytes(_province_df(cur)).getvalue(),
+        build_highway_workbook_bytes(
+            _province_df(cur), fill_empty_with=STANDARD00_MISSING_CELL
+        ).getvalue(),
     )
-    add("03_功率段分布.xlsx", build_power_workbook_placeholder(cur).getvalue())
+    add("03_功率段分布.xlsx", build_power_workbook_standard00(cur, prev).getvalue())
     add("04_排行榜.xlsx", build_ranking_workbook(cur, prev).getvalue())
     add("05_全国概况.xlsx", build_national_workbook(cur, prev).getvalue())
     pb = build_provincial_workbook(cur, prev)

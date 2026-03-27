@@ -10,6 +10,8 @@ from .data_utils import (
     agg_station_count,
     count_piles,
     count_stations,
+    format_share_ratios_4dp_max_remainder_floats,
+    share_as_decimal_4,
 )
 
 # 全国概况各 Sheet 统一列（有数据时）
@@ -41,11 +43,13 @@ def province_breakdown_by_row_count(df: pd.DataFrame) -> pd.DataFrame:
     total = int(g.sum())
     if total == 0:
         return _empty_overview_table()
+    cnts = [float(v) for v in g.values]
+    ratios = format_share_ratios_4dp_max_remainder_floats(cnts)
     return pd.DataFrame(
         {
             "省份": g.index.tolist(),
             "数量": g.values.astype(int).tolist(),
-            "全国占比": [f"{(v / total * 100):.1f}%" for v in g.values],
+            "全国占比": ratios,
             "环比增速": [""] * len(g),
         }
     )
@@ -83,14 +87,14 @@ def province_ranking_table(df: pd.DataFrame, for_pile: bool = True, top_n: int =
         agg = agg_station_count(df, prov_col, False, apply_filter=True)
     if agg.empty:
         return pd.DataFrame(columns=["排名", "省份", "数量", "全国占比", "环比增速"])
-    total = agg.sum()
+    national_total = float(agg.sum())
     agg = agg.sort_values(ascending=False).head(top_n)
     return pd.DataFrame(
         {
             "排名": range(1, len(agg) + 1),
             "省份": agg.index.astype(str).tolist(),
             "数量": agg.values.tolist(),
-            "全国占比": [f"{(v / total * 100):.1f}%" for v in agg.values],
+            "全国占比": [share_as_decimal_4(v, national_total) for v in agg.values],
             "环比增速": ["—"] * len(agg),
         }
     )
@@ -146,6 +150,16 @@ def write_national_workbook_bytes(df: pd.DataFrame, for_pile: bool = True) -> By
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         for sheet_name, tbl in get_national_workbook_tables(df, for_pile=for_pile):
             safe = sheet_name[:31]
+            if sheet_name == "充电电量" and not tbl.empty and "数量" in tbl.columns:
+                tbl = tbl.copy()
+                tbl["数量"] = tbl["数量"].apply(
+                    lambda x: (
+                        int(round(x / 10000.0))
+                        if isinstance(x, (int, float))
+                        and abs(x / 10000.0 - round(x / 10000.0)) < 1e-9
+                        else (x / 10000.0 if isinstance(x, (int, float)) else x)
+                    )
+                )
             tbl.to_excel(writer, sheet_name=safe, index=False)
     buf.seek(0)
     return buf

@@ -5,6 +5,11 @@ from typing import List, Optional, Tuple
 
 import pandas as pd
 
+from .data_utils import (
+    format_share_ratios_4dp_max_remainder_floats,
+    share_as_decimal_4,
+)
+
 
 def _operator_col(df: pd.DataFrame) -> Optional[str]:
     if "运营商名称" in df.columns:
@@ -33,11 +38,13 @@ def sheet_market_share(df: pd.DataFrame) -> pd.DataFrame:
     total = int(g.sum())
     if total == 0:
         return pd.DataFrame(columns=cols)
+    cnts = [float(v) for v in g.values]
+    ratios = format_share_ratios_4dp_max_remainder_floats(cnts)
     return pd.DataFrame(
         {
             "运营商": g.index.tolist(),
             "公共充电设施总量": g.values.astype(int).tolist(),
-            "市场份额": [f"{(v / total * 100):.1f}%" for v in g.values],
+            "市场份额": ratios,
             "环比增速": [""] * len(g),
         }
     )
@@ -69,13 +76,14 @@ def sheet_city_top10(df: pd.DataFrame) -> pd.DataFrame:
     g = df.groupby(df[city_col].fillna("未知").astype(str), dropna=False).size()
     g = g.sort_values(ascending=False).head(10)
     total = len(df)
+    if total <= 0:
+        return pd.DataFrame(columns=cols)
+    # 分母为全表行数，Top10 占比之和一般小于 1，逐行 round 即可
     return pd.DataFrame(
         {
             "城市": g.index.tolist(),
             "公共充电设施总量": g.values.astype(int).tolist(),
-            "全国占比": [
-                f"{(v / total * 100):.1f}%" if total else "0%" for v in g.values
-            ],
+            "全国占比": [share_as_decimal_4(v, total) for v in g.values],
             "环比增速": [""] * len(g),
         }
     )

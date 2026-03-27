@@ -1,7 +1,93 @@
 # handlers/data_utils.py - 统计口径：充电桩用序号、充电站用充电站内部编号且站内桩数>2
 
-from typing import Optional, Tuple
+import math
+from typing import List, Optional, Sequence, Tuple, Union
+
 import pandas as pd
+
+
+def share_as_decimal_4(numerator: Union[int, float], total: Union[int, float]) -> float:
+    """占比 numerator/total，为 0～1 的 float，保留四位小数；分母无效时为 0.0。"""
+    try:
+        t = float(total)
+        v = float(numerator)
+    except (TypeError, ValueError):
+        return 0.0
+    if t <= 0:
+        return 0.0
+    return round(v / t, 4)
+
+
+def scalar_percent_text_to_decimal_ratio(val):
+    """
+    若单元格为含半角 % 或全角 ％ 的文本（如 12.34%、12.34％），按「百分数→比例」转为 float 并保留四位小数；
+    其余类型与原值不变。
+    """
+    if val is None:
+        return val
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        if isinstance(val, float) and pd.isna(val):
+            return val
+        return val
+    s = str(val).strip()
+    if "%" not in s and "\uff05" not in s:
+        return val
+    s = s.replace("%", "").replace("\uff05", "").strip().replace(",", "")
+    if s in ("", "—", "-", "–", "NaN", "nan"):
+        return val
+    try:
+        return round(float(s) / 100.0, 4)
+    except (TypeError, ValueError):
+        return val
+
+
+def dataframe_cells_percent_to_decimal_ratio(df: pd.DataFrame) -> pd.DataFrame:
+    """对表内所有列逐格：凡文本中含 %／％ 则转为 0～1 小数（四位），用于功率段等多 Sheet 导出。"""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    for c in out.columns:
+        out[c] = out[c].map(scalar_percent_text_to_decimal_ratio)
+    return out
+
+
+def format_share_ratios_4dp_max_remainder_floats(values: Sequence[float]) -> List[float]:
+    """
+    一组非负数量在同一分母下的占比，为 0～1 的 float（四位精度，万分之一最大余额法，合计为 1）。
+    """
+    vals = [float(v) for v in values]
+    n = len(vals)
+    if n == 0:
+        return []
+    total = sum(vals)
+    if total <= 0:
+        return [0.0] * n
+    exact_bp = [v / total * 10000.0 for v in vals]
+    floor_bp = [math.floor(x + 1e-9) for x in exact_bp]
+    rem = int(round(10000 - sum(floor_bp)))
+    frac = [exact_bp[i] - floor_bp[i] for i in range(n)]
+    order_desc = sorted(range(n), key=lambda i: (-frac[i], -vals[i], i))
+    adj = list(floor_bp)
+    if rem > 0:
+        for i in range(rem):
+            adj[order_desc[i % n]] += 1
+    elif rem < 0:
+        order_asc = sorted(range(n), key=lambda i: (frac[i], vals[i], i))
+        for i in range(-rem):
+            idx = order_asc[i % n]
+            if adj[idx] > 0:
+                adj[idx] -= 1
+    return [round(adj[i] / 10000.0, 4) for i in range(n)]
+
+
+def format_share_ratios_4dp_max_remainder(values: Sequence[float]) -> List[str]:
+    """
+    一组非负数量在同一分母下的占比，写为 0～1 的小数字符串（四位）；
+    在万分之一上用最大余额法分配，使各值之和为 1.0000。
+    """
+    return [f"{x:.4f}" for x in format_share_ratios_4dp_max_remainder_floats(values)]
 
 
 def pile_count_col(df: pd.DataFrame, for_pile: bool) -> Optional[str]:

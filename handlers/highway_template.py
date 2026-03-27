@@ -52,16 +52,39 @@ def _num(v) -> Optional[float]:
         return None
 
 
-def build_highway_workbook_bytes(province_df: Optional[pd.DataFrame]) -> BytesIO:
+def _fill_highway_sheet_blanks(ws, placeholder: str, *, header_rows: int = 1) -> None:
+    """数据区（表头以下）凡单元格为 None 或空字符串，写入 placeholder。"""
+    if ws.max_row <= header_rows:
+        return
+    for row in ws.iter_rows(
+        min_row=header_rows + 1,
+        max_row=ws.max_row,
+        min_col=1,
+        max_col=ws.max_column,
+    ):
+        for cell in row:
+            val = cell.value
+            if val is None:
+                cell.value = placeholder
+            elif isinstance(val, str) and val.strip() == "":
+                cell.value = placeholder
+
+
+def build_highway_workbook_bytes(
+    province_df: Optional[pd.DataFrame],
+    *,
+    fill_empty_with: Optional[str] = None,
+) -> BytesIO:
     """
     基于模板生成 02 高速公路 xlsx。
     province_df 为 00 表「省份」Sheet；按列名与 Sheet 名一致填入「数量」列。
     无模板时退回单 Sheet 说明。
+    fill_empty_with：若传入（如由标准 00 表生成时传反斜杠占位符），数量缺失及数据区其它空白单元格均写入该占位。
     """
     path = resolve_highway_template_path()
     if path is None or load_workbook is None:
         buf = BytesIO()
-        pd.DataFrame(
+        df = pd.DataFrame(
             {
                 "说明": [
                     "未找到高速公路模板。请将 模板_高速公路_样例.xlsx 置于："
@@ -69,9 +92,15 @@ def build_highway_workbook_bytes(province_df: Optional[pd.DataFrame]) -> BytesIO
                     + "；或放入项目 assets/模板_高速公路_样例.xlsx。"
                 ]
             }
-        ).to_excel(
-            buf, index=False, engine="openpyxl"
         )
+        if fill_empty_with:
+            from handlers.standard00_transform import standard00_fill_missing_cells
+
+            standard00_fill_missing_cells(df).to_excel(
+                buf, index=False, engine="openpyxl"
+            )
+        else:
+            df.to_excel(buf, index=False, engine="openpyxl")
         buf.seek(0)
         return buf
 
@@ -93,11 +122,14 @@ def build_highway_workbook_bytes(province_df: Optional[pd.DataFrame]) -> BytesIO
                     continue
                 v = _num(r.get(sheet_name))
                 if v is None:
-                    ws.append([pname, None])
+                    q = fill_empty_with if fill_empty_with is not None else None
+                    ws.append([pname, q])
                 elif abs(v - round(v)) < 1e-9:
                     ws.append([pname, int(round(v))])
                 else:
                     ws.append([pname, v])
+        if fill_empty_with:
+            _fill_highway_sheet_blanks(ws, fill_empty_with)
 
     bio = BytesIO()
     wb.save(bio)

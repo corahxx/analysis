@@ -3,6 +3,8 @@
 import os
 import sys
 import importlib
+import urllib.error
+import urllib.request
 from datetime import date
 from io import BytesIO
 import streamlit as st
@@ -334,9 +336,49 @@ def _render_raw_to_standard00_page() -> None:
         st.info("请上传原始汇总 xlsx。")
 
 
+def _render_power_table_mom_page() -> None:
+    """侧栏「功率表添加环比」：对目录内多月份功率段 xlsx 原地写入环比列。"""
+    st.markdown(_banner_with_background("product-banner.png"), unsafe_allow_html=True)
+    st.markdown(
+        '<p style="color:#546e7a;font-size:0.95rem;font-weight:500;margin:1.5rem 0 1rem 0;letter-spacing:0.02em;">'
+        "功率表添加环比</p>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("### 说明")
+    st.caption(
+        "将**同一文件夹**内、文件名以 **_YYYYMM.xlsx** 结尾的功率段工作簿按月份排序，"
+        "从第二期起用**上一期**的「数量」按 **(省份, 功率段)** 对齐，写入本期「环比」列（**原地保存**）。"
+        "规则与「标准化数据产品-由标准00表生成」中的环比增速一致："
+        "(本期−上期)/上期，**四位小数**（比例，非百分号）；上期为 0 且本期非 0 为「—」；两期均为 0 为「0.0000」。"
+        "导出/预览中「占比」列为 **0～1 的小数**（四位）。"
+        "「总」Sheet 需含列：省份、功率段、数量、占比、环比；分省 Sheet 为：功率段、数量、占比、环比（Sheet 名即省份）。"
+    )
+    folder = st.text_input(
+        "文件夹路径（本机）",
+        key="power_mom_folder_input",
+        placeholder=r"例如：D:\数据\功率表",
+    )
+    if st.button("执行环比填充", type="primary", key="power_mom_run_btn"):
+        from handlers.power_table_mom import run_fill_power_mom_on_folder
+
+        with st.spinner("正在读取并写回 Excel…"):
+            ok, msg, details = run_fill_power_mom_on_folder(folder)
+        if ok:
+            st.success(msg)
+            for line in details:
+                st.write(line)
+        else:
+            st.error(msg)
+            for line in details:
+                st.code(line)
+
+
 # 必备列（与 merge 规范一致，至少具备关键列即可入库）
 PILE_KEY_COLS = ["充电桩编号", "所属充电站编号"]
 STATION_KEY_COLS = ["所属充电站编号", "充电站内部编号"]
+
+# 入库「路径或链接」与 radio 选项文案一致（勿与「本地上传」重复）
+_IMPORT_SOURCE_PATH_OR_URL = "本机路径或链接（CSV，支持多个）"
 
 
 def _validate_columns(df: pd.DataFrame, for_pile: bool) -> tuple[bool, str]:
@@ -346,6 +388,61 @@ def _validate_columns(df: pd.DataFrame, for_pile: bool) -> tuple[bool, str]:
     if missing:
         return False, f"缺少必备列：{', '.join(missing)}"
     return True, ""
+
+
+def _normalize_import_line(s: str) -> str:
+    """去掉首尾空白及成对英文引号（粘贴自资源管理器时常带 \"...\"）。"""
+    t = (s or "").strip()
+    if len(t) >= 2 and t[0] == t[-1] and t[0] in "\"'":
+        t = t[1:-1].strip()
+    return t
+
+
+def _parse_import_urls(text: str) -> list[str]:
+    """每行一个本机路径或 URL；忽略空行与 # 开头注释。"""
+    out: list[str] = []
+    for line in (text or "").splitlines():
+        s = _normalize_import_line(line)
+        if not s or s.startswith("#"):
+            continue
+        out.append(s)
+    return out
+
+
+def _read_csv_from_location(loc: str, nrows: int | None = None) -> pd.DataFrame:
+    """读取 CSV：支持 Windows/macOS/Linux 本机路径、http(s)、file://（utf-8-sig）。"""
+    raw = _normalize_import_line(loc)
+    if not raw:
+        raise ValueError("路径或链接为空")
+
+    low = raw.lower()
+    if low.startswith("http://") or low.startswith("https://"):
+        req = urllib.request.Request(
+            raw,
+            headers={"User-Agent": "Mozilla/5.0 Analysis-Import/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = resp.read()
+        return pd.read_csv(BytesIO(data), encoding="utf-8-sig", nrows=nrows)
+
+    if low.startswith("file:"):
+        from urllib.parse import unquote, urlparse
+
+        pu = urlparse(raw)
+        fp = unquote(pu.path)
+        if os.name == "nt" and len(fp) >= 3 and fp[0] == "/" and fp[2] == ":":
+            fp = fp[1:]
+        fp = os.path.normpath(fp)
+        if os.path.isfile(fp):
+            return pd.read_csv(fp, encoding="utf-8-sig", nrows=nrows)
+        raise FileNotFoundError(f"本地文件不存在：{fp}")
+
+    path = os.path.normpath(os.path.expandvars(os.path.expanduser(raw)))
+    if os.path.isfile(path):
+        return pd.read_csv(path, encoding="utf-8-sig", nrows=nrows)
+    raise FileNotFoundError(
+        f"找不到本机文件，且不是 http(s) 链接：{path}"
+    )
 
 
 st.set_page_config(
@@ -373,6 +470,7 @@ _NAV_OPTIONS = [
     "标准化数据产品-由数据库生成",
     "标准化数据产品-由原始表生成标准00表",
     "标准化数据产品-由标准00表生成",
+    "功率表添加环比",
 ]
 _LEGACY_VIEW_MODE = {
     "标准化数据产品": "标准化数据产品-由数据库生成",
@@ -546,15 +644,50 @@ if st.session_state.view_mode == "入库":
     )
 
     st.markdown("### 执行入库")
-    import_file = st.file_uploader(
-        "选择清洗后文件",
-        type=["xlsx", "xls", "csv"],
-        key="import_upload",
-        help="支持 Excel / CSV，列需与 merge 清洗后一致；选「其他」时可导入任意表头表格",
+    import_source = st.radio(
+        "数据文件来源",
+        options=["本地上传", _IMPORT_SOURCE_PATH_OR_URL],
+        index=0,
+        horizontal=True,
+        key="import_source",
+        help="每行一条：本机绝对路径（如 D:\\\\data\\\\a.csv，可带引号）或 http(s) 链接；按顺序导入同一目标表。",
     )
+    import_file = None
+    import_url_text = ""
+    if import_source == "本地上传":
+        import_file = st.file_uploader(
+            "选择清洗后文件",
+            type=["xlsx", "xls", "csv"],
+            key="import_upload",
+            help="支持 Excel / CSV，列需与 merge 清洗后一致；选「其他」时可导入任意表头表格",
+        )
+    else:
+        import_url_text = st.text_area(
+            "每行一个：本机 CSV 路径或下载链接",
+            height=120,
+            key="import_url_text",
+            placeholder="D:\\\\数据\\\\a.csv\nhttps://example.com/b.csv",
+        )
+        st.caption(
+            "支持 **Windows 本机路径**（可从资源管理器地址栏复制，带或不带引号）与 **http(s) 链接**；"
+            "多个条目按**从上到下**顺序导入**同一目标表**。仅 CSV（utf-8 / 带 BOM）。"
+        )
+
+    if (
+        _backend == "postgresql"
+        and _pg_config
+        and import_mode in ("新增表（空白）", "新增表（复制其他表结构）")
+        and table_type_import != "其他"
+    ):
+        st.checkbox(
+            "快速入库（PostgreSQL：跳过临时表，直接 COPY 至目标表；不做 uid 去重）",
+            value=False,
+            key="import_pg_fast",
+            help="适合新建空表后整表导入。需要临时表校验或按 uid 去重入库正式表时请勿勾选。",
+        )
 
     df_other_full = None
-    if import_file is not None:
+    if import_source == "本地上传" and import_file is not None:
         try:
             if table_type_import == "其他":
                 import_file.seek(0)
@@ -570,6 +703,38 @@ if st.session_state.view_mode == "入库":
                 import_file.seek(0)
         except Exception as e:
             st.error(f"读取文件失败：{e}")
+    elif import_source == _IMPORT_SOURCE_PATH_OR_URL and table_type_import == "其他":
+        _urls_o = _parse_import_urls(import_url_text)
+        if _urls_o:
+            try:
+                _dfs_o = []
+                for _u in _urls_o:
+                    _dfs_o.append(_read_csv_from_location(_u))
+                if len(_dfs_o) == 1:
+                    df_other_full = _dfs_o[0]
+                else:
+                    _base = list(_dfs_o[0].columns)
+                    _bad = False
+                    for _j, _d in enumerate(_dfs_o[1:], start=2):
+                        if list(_d.columns) != _base:
+                            st.error(
+                                f"第 {_j} 个链接的表头与第一个不一致，无法合并为一张表。"
+                            )
+                            _bad = True
+                            break
+                    if not _bad:
+                        df_other_full = pd.concat(_dfs_o, ignore_index=True)
+            except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
+                st.error(f"下载或读取链接失败：{e}")
+            except Exception as e:
+                st.error(f"解析 CSV 失败：{e}")
+    elif import_source == _IMPORT_SOURCE_PATH_OR_URL and table_type_import != "其他":
+        _urls_peek = _parse_import_urls(import_url_text)
+        if _urls_peek:
+            try:
+                _read_csv_from_location(_urls_peek[0], nrows=5)
+            except Exception as e:
+                st.warning(f"首个链接试读失败（仍可尝试执行入库）：{e}")
 
     # ---------- 「其他」类型：识别表头 + 建议字段类型 + 确认后建表并导入 ----------
     if table_type_import == "其他" and df_other_full is not None and not df_other_full.empty:
@@ -602,7 +767,9 @@ if st.session_state.view_mode == "入库":
             placeholder="例如：my_data_20250101",
         )
         if st.button("确认表结构并导入", type="primary", key="do_import_other"):
-            if not other_table_name or not other_table_name.strip():
+            if df_other_full is None or df_other_full.empty:
+                st.warning("请先上传文件或粘贴有效的 CSV 链接。")
+            elif not other_table_name or not other_table_name.strip():
                 st.warning("请填写新表名称。")
             else:
                 final_name = other_table_name.strip()
@@ -633,8 +800,11 @@ if st.session_state.view_mode == "入库":
         st.stop()
 
     if st.button("执行入库", type="primary", key="do_import"):
-        if import_file is None:
-            st.warning("请先选择清洗后文件。")
+        _urls_run = _parse_import_urls(import_url_text)
+        _has_local = import_source == "本地上传" and import_file is not None
+        _has_link = import_source == _IMPORT_SOURCE_PATH_OR_URL and len(_urls_run) > 0
+        if not _has_local and not _has_link:
+            st.warning("请先选择本地文件，或粘贴至少一条本机路径 / http(s) 链接。")
         elif import_mode == "已有表追加数据" and not target_table:
             st.warning("请选择目标表。")
         elif import_mode == "新增表（复制其他表结构）" and (
@@ -644,25 +814,38 @@ if st.session_state.view_mode == "入库":
         elif _backend == "postgresql" and _pg_config and not _pg_schema_sel:
             st.warning("使用 PostgreSQL 时请先在上方选择 Schema。")
         else:
-            try:
-                if import_file.name.lower().endswith(".csv"):
-                    df_import = pd.read_csv(import_file, encoding="utf-8-sig")
-                else:
-                    df_import = pd.read_excel(import_file, engine="openpyxl")
-            except Exception as e:
-                st.error(f"读取文件失败：{e}")
-                df_import = None
+            _toast_fn = getattr(st, "toast", None)
+            if callable(_toast_fn):
+                try:
+                    _toast_fn("已开始执行入库…", icon="📥")
+                except TypeError:
+                    _toast_fn("已开始执行入库…")
+            with st.spinner("正在执行入库：读取数据并写入数据库，请稍候…"):
+                dfs_batch: list[tuple[pd.DataFrame, str]] = []
+                try:
+                    if import_source == "本地上传":
+                        if import_file is None:
+                            dfs_batch = []
+                        else:
+                            if import_file.name.lower().endswith(".csv"):
+                                _df0 = pd.read_csv(import_file, encoding="utf-8-sig")
+                            else:
+                                _df0 = pd.read_excel(import_file, engine="openpyxl")
+                            dfs_batch = [(_df0, import_file.name)]
+                    else:
+                        for _u in _urls_run:
+                            dfs_batch.append((_read_csv_from_location(_u), _u))
+                except Exception as e:
+                    st.error(f"读取数据失败：{e}")
+                    dfs_batch = []
 
-            if df_import is not None and not df_import.empty:
-                for_pile = table_type_import == "充电桩表"
-                ok, msg = _validate_columns(df_import, for_pile)
-                if not ok:
-                    st.error(msg)
-                else:
+                if dfs_batch:
+                    for_pile = table_type_import == "充电桩表"
                     from db_helper import (
                         create_table_from_df,
                         create_table_like,
                         get_connection,
+                        import_dataframe_direct_pg_copy,
                         import_dataframe_via_staging,
                     )
 
@@ -670,64 +853,119 @@ if st.session_state.view_mode == "入库":
                     _pg = st.session_state.get("pg_config") if _be == "postgresql" else None
                     engine = get_connection(backend=_be, pg_config=_pg)
                     _pg_s = _pg_schema_sel if _be == "postgresql" else None
+                    _use_pg_fast = (
+                        _be == "postgresql"
+                        and bool(st.session_state.get("import_pg_fast"))
+                        and import_mode
+                        in ("新增表（空白）", "新增表（复制其他表结构）")
+                    )
                     final_table = target_table
                     if import_mode == "新增表（空白）" and not final_table:
                         suffix = date.today().strftime("%Y%m%d")
                         final_table = f"pile_{suffix}" if for_pile else f"station_{suffix}"
 
-                    try:
-                        if import_mode == "新增表（空白）":
-                            created = create_table_from_df(
-                                engine, final_table, df_import, pg_schema=_pg_s
-                            )
-                            if created:
-                                st.success(f"已创建新表：{final_table}")
-                            else:
-                                st.info(f"表 {final_table} 已存在，将向其中追加（经临时表校验后写入）。")
-                        elif import_mode == "新增表（复制其他表结构）":
-                            created = create_table_like(
-                                engine,
-                                final_table,
-                                structure_source_table,
-                                pg_schema=_pg_s,
-                            )
-                            if created:
-                                st.success(
-                                    f"已按「{structure_source_table}」结构创建新表：{final_table}"
-                                )
-                            else:
-                                st.info(
-                                    f"表 {final_table} 已存在，将按现有结构经临时表校验后写入。"
-                                )
-                    except Exception as e:
-                        st.error(f"建表失败：{e}")
-                        df_import = None
-
-                    if df_import is not None:
-                        ok_imp, msg_imp, n_staged, errs_imp = import_dataframe_via_staging(
-                            engine,
-                            final_table,
-                            df_import,
-                            pg_schema=_pg_s,
+                    _stopped = False
+                    _total_staged = 0
+                    for batch_i, (df_import, src_label) in enumerate(dfs_batch):
+                        if df_import is None or df_import.empty:
+                            st.warning(f"跳过空表：{src_label[:120]}")
+                            continue
+                        st.markdown(
+                            f"**第 {batch_i + 1} / {len(dfs_batch)} 批** `{src_label[:160]}`"
                         )
+                        ok, msg = _validate_columns(df_import, for_pile)
+                        if not ok:
+                            st.error(msg)
+                            _stopped = True
+                            break
+
+                        if batch_i == 0:
+                            try:
+                                if import_mode == "新增表（空白）":
+                                    created = create_table_from_df(
+                                        engine, final_table, df_import, pg_schema=_pg_s
+                                    )
+                                    if created:
+                                        st.success(f"已创建新表：{final_table}")
+                                    else:
+                                        st.info(
+                                            f"表 {final_table} 已存在，将向其中追加（经临时表校验后写入）。"
+                                        )
+                                elif import_mode == "新增表（复制其他表结构）":
+                                    created = create_table_like(
+                                        engine,
+                                        final_table,
+                                        structure_source_table,
+                                        pg_schema=_pg_s,
+                                    )
+                                    if created:
+                                        st.success(
+                                            f"已按「{structure_source_table}」结构创建新表：{final_table}"
+                                        )
+                                    else:
+                                        st.info(
+                                            f"表 {final_table} 已存在，将按现有结构经临时表校验后写入。"
+                                        )
+                            except Exception as e:
+                                st.error(f"建表失败：{e}")
+                                _stopped = True
+                                break
+
+                        if _use_pg_fast:
+                            ok_imp, msg_imp, n_staged, errs_imp = (
+                                import_dataframe_direct_pg_copy(
+                                    engine,
+                                    final_table,
+                                    df_import,
+                                    pg_schema=_pg_s,
+                                )
+                            )
+                        else:
+                            ok_imp, msg_imp, n_staged, errs_imp = (
+                                import_dataframe_via_staging(
+                                    engine,
+                                    final_table,
+                                    df_import,
+                                    pg_schema=_pg_s,
+                                )
+                            )
                         if ok_imp:
                             st.success(msg_imp)
-                            st.metric("成功写入临时表行数", n_staged)
-                            st.metric("失败", 0)
+                            _total_staged += n_staged
                         else:
                             st.error(msg_imp)
-                            st.metric("临时表校验通过行数", 0)
-                            st.metric("失败", len(df_import))
                             if errs_imp:
                                 with st.expander("错误详情（前若干条）"):
                                     for err in errs_imp:
                                         st.code(err)
+                            _stopped = True
+                            break
+
+                    if dfs_batch and not _stopped:
+                        _metric_lbl = (
+                            "各批合计（COPY 成功行数）"
+                            if _use_pg_fast
+                            else "各批合计（临时表成功行数）"
+                        )
+                        st.metric(_metric_lbl, _total_staged)
+                        st.metric("失败", 0)
+                    elif dfs_batch and _stopped and _total_staged > 0:
+                        st.warning("已中止后续批次；已成功写入的数据保留在库中。")
+                        _metric_lbl2 = (
+                            "已成功批次合计（COPY 行数）"
+                            if _use_pg_fast
+                            else "已成功批次合计（临时表行数）"
+                        )
+                        st.metric(_metric_lbl2, _total_staged)
 
 elif st.session_state.view_mode == "标准化数据产品-由标准00表生成":
     _render_standard00_transform_page()
 
 elif st.session_state.view_mode == "标准化数据产品-由原始表生成标准00表":
     _render_raw_to_standard00_page()
+
+elif st.session_state.view_mode == "功率表添加环比":
+    _render_power_table_mom_page()
 
 else:
     # ========== 标准化数据产品页：顶部图块 + 标题（图下，与 ### 区分） ==========
@@ -1067,7 +1305,9 @@ else:
         power_suffix = _power_mod.power_chart_title_suffix(for_pile)
         st.markdown(f"#### 功率段分布 {power_suffix}")
         prov_list = _power_mod.list_power_preview_provinces(df, for_pile=for_pile)
-        power_wb = _power_mod.write_power_province_workbook(df, for_pile=for_pile)
+        power_wb = _power_mod.write_power_province_workbook(
+            df, for_pile=for_pile, prepend_total_sheet=True
+        )
         if prov_list and power_wb is not None:
             sel_power_prov = st.selectbox(
                 "选择省份预览",
