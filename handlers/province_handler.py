@@ -6,7 +6,7 @@ from typing import List, Optional, Tuple
 
 import pandas as pd
 
-from .data_utils import count_piles, count_stations
+from .data_utils import count_piles, count_stations, province_names_with_taiwan, TAIWAN_PROVINCE
 
 # 省级数据产品固定维度行（顺序不可改）
 PROVINCE_DIMENSION_ROWS: Tuple[str, ...] = (
@@ -72,6 +72,15 @@ def province_dimension_product_table(
 
     sub = df[df[prov_col].fillna("未知").astype(str) == str(province)]
 
+    if sub.empty:
+        return pd.DataFrame(
+            {
+                "数据维度": list(PROVINCE_DIMENSION_ROWS),
+                "数值": ["\\"] * len(PROVINCE_DIMENSION_ROWS),
+                "环比变化": ["\\"] * len(PROVINCE_DIMENSION_ROWS),
+            }
+        )
+
     if not for_pile:
         return pd.DataFrame(
             {
@@ -118,12 +127,10 @@ def list_province_product_names(df: pd.DataFrame) -> List[str]:
     """预览/Sheet 逻辑名列表（与 省份_中文 取值一致，排序后「未知」靠后）。"""
     prov_col = _province_col(df)
     if prov_col is None:
-        return []
-    names = sorted(
-        df[prov_col].fillna("未知").astype(str).unique().tolist(),
-        key=lambda x: (x == "未知", x),
+        return [TAIWAN_PROVINCE]
+    return province_names_with_taiwan(
+        df[prov_col].fillna("未知").astype(str).unique().tolist()
     )
-    return names
 
 
 def get_provincial_workbook_tables(

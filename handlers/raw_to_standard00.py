@@ -10,6 +10,15 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import pandas as pd
 
+from handlers.data_utils import (
+    TAIWAN_PROVINCE,
+    agg_pile_count,
+    agg_station_count,
+    append_taiwan_placeholder_row,
+    count_stations,
+    province_names_with_taiwan,
+)
+
 # 输出 Sheet 与列顺序（与 00表标准化-系统输入-YYMM.xlsx 一致）
 PROVINCE_COLUMNS: List[str] = [
     "省份",
@@ -51,6 +60,30 @@ CITY_COLUMNS = ["城市", "公共充电设施总量"]
 MODEL_COLUMNS = ["设备型号", "装机量"]
 OEM_COLUMNS = ["车企名称", "私桩安装量"]
 SWAP_OP_COLUMNS = ["运营商", "数量"]
+
+
+def _province_col_from_df(df: pd.DataFrame) -> Optional[str]:
+    if "省份_中文" in df.columns:
+        return "省份_中文"
+    if "省份" in df.columns:
+        return "省份"
+    return None
+
+
+def _city_col_from_df(df: pd.DataFrame) -> Optional[str]:
+    if "城市_中文" in df.columns:
+        return "城市_中文"
+    if "城市" in df.columns:
+        return "城市"
+    return None
+
+
+def _operator_col_from_df(df: pd.DataFrame) -> Optional[str]:
+    if "运营商名称" in df.columns:
+        return "运营商名称"
+    if "上报机构" in df.columns:
+        return "上报机构"
+    return None
 
 
 def _norm_sheet_for_match(name: str) -> str:
@@ -649,8 +682,9 @@ def build_province_dataframe(
         )
     out = pd.DataFrame(rows)
     if out.empty:
-        return pd.DataFrame(columns=PROVINCE_COLUMNS)
-    return out[PROVINCE_COLUMNS]
+        out = pd.DataFrame(columns=PROVINCE_COLUMNS)
+    out = out[PROVINCE_COLUMNS]
+    return append_taiwan_placeholder_row(out, fill_value=pd.NA)
 
 
 def _read_operator_swap_station_from_facility_sheet(
@@ -1180,6 +1214,132 @@ def build_swap_operator_dataframe(
         reverse=True,
     )
     return pd.DataFrame(rows, columns=SWAP_OP_COLUMNS)
+
+
+def build_standard00_workbook_from_dataframe(
+    df: pd.DataFrame,
+    *,
+    for_pile: bool,
+    yymm: str,
+) -> Tuple[BytesIO, str]:
+    """
+    从当前明细 DataFrame 直接聚合生成标准 00 表。
+    仅填入当前数据能稳定得到的字段，其余保持空白占位。
+    """
+    prov_col = _province_col_from_df(df)
+    city_col = _city_col_from_df(df)
+    op_col = _operator_col_from_df(df)
+
+    province_names = province_names_with_taiwan(
+        df[prov_col].fillna("未知").astype(str).unique().tolist() if prov_col else []
+    )
+    province_rows: List[Dict[str, Any]] = []
+    for pname in province_names:
+        sub = (
+            df[df[prov_col].fillna("未知").astype(str) == pname].copy()
+            if prov_col
+            else df.iloc[0:0].copy()
+        )
+        is_tw_placeholder = pname == TAIWAN_PROVINCE and sub.empty
+        pub_cnt = int(len(sub)) if for_pile and not sub.empty else pd.NA
+        st_cnt = count_stations(sub, for_pile, apply_filter=True) if not sub.empty else pd.NA
+        ac_cnt = pd.NA
+        dc_cnt = pd.NA
+        acdc_cnt = pd.NA
+        if for_pile and not sub.empty and "充电桩类型_转换" in sub.columns:
+            ac_cnt = int((sub["充电桩类型_转换"].astype(str).str.strip() == "交流").sum())
+            dc_cnt = int((sub["充电桩类型_转换"].astype(str).str.strip() == "直流").sum())
+            acdc_cnt = int((sub["充电桩类型_转换"].astype(str).str.strip() == "交直流").sum())
+        province_rows.append(
+            {
+                "省份": pname,
+                "公共充电桩": pd.NA if is_tw_placeholder else pub_cnt,
+                "新能源车保有量": pd.NA,
+                "公共充电设施数量": pd.NA if is_tw_placeholder else pub_cnt,
+                "高速公路沿线已建设及预留建设充电停车位服务区": pd.NA,
+                "高速公路沿线已建设充电停车位总数": pd.NA,
+                "充电站": pd.NA if is_tw_placeholder else st_cnt,
+                "交流桩": pd.NA if is_tw_placeholder else ac_cnt,
+                "直流桩": pd.NA if is_tw_placeholder else dc_cnt,
+                "交直流桩数量": pd.NA if is_tw_placeholder else acdc_cnt,
+                "共享私桩": pd.NA,
+                "换电站": pd.NA,
+                "换电电量（万度）": pd.NA,
+                "私桩及个人充电设施": pd.NA,
+                "随车配建": pd.NA,
+                "充电电量": pd.NA,
+            }
+        )
+    prov = pd.DataFrame(province_rows, columns=PROVINCE_COLUMNS)
+
+    op_rows: List[Dict[str, Any]] = []
+    if op_col:
+        if for_pile:
+            op_agg = agg_pile_count(df, op_col, True)
+        else:
+            op_agg = agg_station_count(df, op_col, False, apply_filter=True)
+        power_agg = pd.Series(dtype=float)
+        if for_pile and "额定功率" in df.columns:
+            _tmp = df.copy()
+            _tmp["_pwr_"] = pd.to_numeric(_tmp["额定功率"], errors="coerce")
+            _tmp = _tmp.dropna(subset=["_pwr_"])
+            if not _tmp.empty:
+                power_agg = _tmp.groupby(_tmp[op_col].fillna("未知").astype(str), dropna=False)["_pwr_"].sum()
+        for op_name in op_agg.sort_values(ascending=False).index.astype(str).tolist():
+            op_rows.append(
+                {
+                    "运营商": op_name,
+                    "公共充电设施总量": int(op_agg.get(op_name, 0)),
+                    "新增销量": pd.NA,
+                    "星级场站数": pd.NA,
+                    "共享私桩": pd.NA,
+                    "公用充电桩": pd.NA,
+                    "专用充电桩": pd.NA,
+                    "直流桩": pd.NA,
+                    "交流桩": pd.NA,
+                    "三相交流桩": pd.NA,
+                    "充电功率": (
+                        int(power_agg.get(op_name))
+                        if op_name in power_agg.index and abs(power_agg.get(op_name) - round(power_agg.get(op_name))) < 1e-9
+                        else (float(power_agg.get(op_name)) if op_name in power_agg.index else pd.NA)
+                    ),
+                    "充电电量（万度）": pd.NA,
+                    "充电站": pd.NA,
+                    "换电站": pd.NA,
+                }
+            )
+    opdf = pd.DataFrame(op_rows, columns=OPERATOR_COLUMNS)
+
+    city_df = pd.DataFrame(columns=CITY_COLUMNS)
+    if city_col:
+        g = df.groupby(df[city_col].fillna("未知").astype(str), dropna=False).size().sort_values(ascending=False)
+        city_df = pd.DataFrame(
+            {"城市": g.index.astype(str).tolist(), "公共充电设施总量": g.values.astype(int).tolist()},
+            columns=CITY_COLUMNS,
+        )
+
+    model_df = pd.DataFrame(columns=MODEL_COLUMNS)
+    if for_pile and "充电桩型号" in df.columns:
+        g = df.groupby(df["充电桩型号"].fillna("未知").astype(str), dropna=False).size().sort_values(ascending=False)
+        model_df = pd.DataFrame(
+            {"设备型号": g.index.astype(str).tolist(), "装机量": g.values.astype(int).tolist()},
+            columns=MODEL_COLUMNS,
+        )
+
+    oem_df = pd.DataFrame(columns=OEM_COLUMNS)
+    swap_df = pd.DataFrame(columns=SWAP_OP_COLUMNS)
+
+    bio = BytesIO()
+    out_name = f"00表标准化-系统输入-{yymm}.xlsx"
+    with pd.ExcelWriter(bio, engine="openpyxl") as w:
+        prov.to_excel(w, sheet_name="省份", index=False)
+        opdf.to_excel(w, sheet_name="运营商", index=False)
+        city_df.to_excel(w, sheet_name="城市", index=False)
+        model_df.to_excel(w, sheet_name="型号", index=False)
+        oem_df.to_excel(w, sheet_name="车企", index=False)
+        swap_df.to_excel(w, sheet_name="换电站-运营商", index=False)
+    bio.seek(0)
+    return bio, out_name
 
 
 def build_standard00_workbook_bytes(

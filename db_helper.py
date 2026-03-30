@@ -1,8 +1,13 @@
 # db_helper.py - 表列表、读表、建表、入库（支持 MySQL / PostgreSQL）
 
 from typing import List, Optional, Tuple, Any, Dict
+import csv
 import os
+from io import StringIO
 import pandas as pd
+
+# 批量 to_sql 失败后，超过此行数则不再逐行重试（避免极慢）
+INSERT_TO_SQL_ROW_FALLBACK_MAX = 5000
 
 from config import DB_CONFIG
 
@@ -457,6 +462,55 @@ def _align_df_to_table_columns(df: pd.DataFrame, table_cols: List[str]) -> pd.Da
     return df[use].copy()
 
 
+def insert_df_to_table_pg_copy(
+    engine,
+    table_name: str,
+    df: pd.DataFrame,
+    pg_schema: Optional[str],
+    columns: List[str],
+) -> Tuple[int, int, List[str]]:
+    """
+    仅 PostgreSQL：用 COPY FROM STDIN (FORMAT csv) 写入，接近 psql \\copy 性能。
+    columns 为与 df 一致的列顺序（通常为表列顺序的子集）。
+    """
+    if not columns:
+        return (0, len(df), ["COPY 列列表为空"])
+    df_sub = df[columns].copy()
+    buf = StringIO()
+    df_sub.to_csv(
+        buf,
+        index=False,
+        header=False,
+        encoding="utf-8",
+        quoting=csv.QUOTE_MINIMAL,
+        lineterminator="\n",
+        doublequote=True,
+    )
+    buf.seek(0)
+
+    q = lambda n: '"' + str(n).replace('"', '""') + '"'
+    cols_sql = ", ".join(q(c) for c in columns)
+    qtbl = _qualified_table_sql(engine, table_name.strip(), pg_schema)
+    copy_sql = (
+        f"COPY {qtbl} ({cols_sql}) FROM STDIN WITH (FORMAT csv, ENCODING 'UTF8')"
+    )
+
+    raw = engine.raw_connection()
+    try:
+        cur = raw.cursor()
+        cur.copy_expert(copy_sql, buf)
+        raw.commit()
+        return (len(df_sub), 0, [])
+    except Exception as e:
+        try:
+            raw.rollback()
+        except Exception:
+            pass
+        return (0, len(df_sub), [str(e)[:800]])
+    finally:
+        raw.close()
+
+
 def _build_insert_from_staging_sql(
     engine,
     target_table: str,
@@ -549,7 +603,19 @@ def import_dataframe_via_staging(
     except Exception as e:
         return False, f"清空临时表失败：{str(e)[:500]}", 0, [str(e)[:500]]
 
-    ok_n, fail_n, errs = insert_df_to_table(engine, staging, df_use, pg_schema=pg_schema)
+    is_pg = False
+    try:
+        is_pg = engine.dialect.name == "postgresql"
+    except Exception:
+        pass
+
+    if is_pg:
+        copy_cols = list(df_use.columns)
+        ok_n, fail_n, errs = insert_df_to_table_pg_copy(
+            engine, staging, df_use, pg_schema, copy_cols
+        )
+    else:
+        ok_n, fail_n, errs = insert_df_to_table(engine, staging, df_use, pg_schema=pg_schema)
     if fail_n > 0 or ok_n < len(df_use):
         msg = (
             f"数据无法全部进入临时表（成功 {ok_n}，失败 {fail_n}）。"
@@ -585,6 +651,52 @@ def import_dataframe_via_staging(
             0,
             [err],
         )
+
+
+def import_dataframe_direct_pg_copy(
+    engine,
+    target_table: str,
+    df: pd.DataFrame,
+    pg_schema: Optional[str] = None,
+) -> Tuple[bool, str, int, List[str]]:
+    """
+    PostgreSQL：跳过临时表与 INSERT…SELECT，直接向目标表 COPY。
+    不做 uid 去重；适用于新建空表后整表导入或明确不需要去重时。
+    """
+    if df is None or df.empty:
+        return False, "没有可导入的数据。", 0, []
+    try:
+        if engine.dialect.name != "postgresql":
+            return False, "快速入库仅支持 PostgreSQL。", 0, []
+    except Exception:
+        return False, "快速入库仅支持 PostgreSQL。", 0, []
+
+    tgt = target_table.strip()
+    if not table_exists(engine, tgt, pg_schema):
+        return False, f"正式表不存在：{tgt}", 0, []
+
+    tcols = get_table_column_names(tgt, engine=engine, pg_schema=pg_schema)
+    if not tcols:
+        return False, "无法读取正式表列信息。", 0, []
+
+    df_use = _align_df_to_table_columns(df, tcols)
+    if df_use.empty:
+        return False, "文件列与目标表无交集，无法导入。", 0, []
+
+    copy_cols = list(df_use.columns)
+    ok_n, fail_n, errs = insert_df_to_table_pg_copy(
+        engine, tgt, df_use, pg_schema, copy_cols
+    )
+    if fail_n > 0 or ok_n < len(df_use):
+        msg = (errs[0] if errs else "COPY 失败")[:800]
+        return False, f"COPY 直接写入失败：{msg}", 0, errs
+
+    return (
+        True,
+        f"已通过 COPY 直接写入表 {tgt}（未走临时表，未做 uid 去重）。",
+        ok_n,
+        [],
+    )
 
 
 def _create_table_suffix(engine) -> str:
@@ -670,7 +782,16 @@ def insert_df_to_table(
         return (len(df), 0, [])
     except Exception as e:
         err_msg = str(e)
-        # 若批量失败，尝试逐行以统计成功/失败
+        if len(df) > INSERT_TO_SQL_ROW_FALLBACK_MAX:
+            return (
+                0,
+                len(df),
+                [
+                    err_msg[:500]
+                    + f"（行数 {len(df)} 超过逐行重试上限 {INSERT_TO_SQL_ROW_FALLBACK_MAX}，已中止。）"
+                ],
+            )
+        # 若批量失败，小表可逐行以统计成功/失败
         success = 0
         fail = 0
         errors: List[str] = []

@@ -8,8 +8,11 @@ import pandas as pd
 from .data_utils import (
     agg_pile_count,
     agg_station_count,
+    append_taiwan_placeholder_row,
     count_piles,
     count_stations,
+    format_share_ratios_4dp_max_remainder_floats,
+    share_as_decimal_4,
 )
 
 # 全国概况各 Sheet 统一列（有数据时）
@@ -41,13 +44,19 @@ def province_breakdown_by_row_count(df: pd.DataFrame) -> pd.DataFrame:
     total = int(g.sum())
     if total == 0:
         return _empty_overview_table()
-    return pd.DataFrame(
+    cnts = [float(v) for v in g.values]
+    ratios = format_share_ratios_4dp_max_remainder_floats(cnts)
+    out = pd.DataFrame(
         {
             "省份": g.index.tolist(),
             "数量": g.values.astype(int).tolist(),
-            "全国占比": [f"{(v / total * 100):.1f}%" for v in g.values],
+            "全国占比": ratios,
             "环比增速": [""] * len(g),
         }
+    )
+    return append_taiwan_placeholder_row(
+        out,
+        fill_value="\\",
     )
 
 
@@ -83,14 +92,14 @@ def province_ranking_table(df: pd.DataFrame, for_pile: bool = True, top_n: int =
         agg = agg_station_count(df, prov_col, False, apply_filter=True)
     if agg.empty:
         return pd.DataFrame(columns=["排名", "省份", "数量", "全国占比", "环比增速"])
-    total = agg.sum()
+    national_total = float(agg.sum())
     agg = agg.sort_values(ascending=False).head(top_n)
     return pd.DataFrame(
         {
             "排名": range(1, len(agg) + 1),
             "省份": agg.index.astype(str).tolist(),
             "数量": agg.values.tolist(),
-            "全国占比": [f"{(v / total * 100):.1f}%" for v in agg.values],
+            "全国占比": [share_as_decimal_4(v, national_total) for v in agg.values],
             "环比增速": ["—"] * len(agg),
         }
     )
@@ -103,7 +112,7 @@ def get_national_workbook_tables(
     全国概况多 Sheet：(Sheet 名, DataFrame)。
     充电站/充电电量等占位 Sheet 为仅表头；公共充电桩/交流/直流/交直流仅桩表按行数分省。
     """
-    empty = _empty_overview_table()
+    empty = append_taiwan_placeholder_row(_empty_overview_table(), fill_value="\\")
     charge_station_sheet = _empty_overview_table()
 
     if not for_pile:

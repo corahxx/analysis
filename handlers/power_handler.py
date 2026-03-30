@@ -5,6 +5,13 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
+from handlers.data_utils import (
+    TAIWAN_PROVINCE,
+    dataframe_cells_percent_to_decimal_ratio,
+    format_share_ratios_4dp_max_remainder_floats,
+    province_names_with_taiwan,
+)
+
 # 固定顺序与文案（与产品约定一致）
 POWER_SEGMENT_LABELS = [
     "p < 120kW",
@@ -13,6 +20,17 @@ POWER_SEGMENT_LABELS = [
     "480-960kW",
     "960kW+",
 ]
+
+
+def _taiwan_placeholder_power_table() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "功率段": POWER_SEGMENT_LABELS,
+            "数量": ["\\"] * len(POWER_SEGMENT_LABELS),
+            "占比": ["\\"] * len(POWER_SEGMENT_LABELS),
+            "环比": ["\\"] * len(POWER_SEGMENT_LABELS),
+        }
+    )
 
 
 def _power_column(df: pd.DataFrame, for_pile: bool) -> Optional[str]:
@@ -52,7 +70,11 @@ def _power_segment_table_from_valid_df(df_valid: pd.DataFrame, col: str) -> pd.D
     cnt = df_valid.loc[s.index].assign(_功率段_=bins).groupby("_功率段_", dropna=False).size()
     total = int(cnt.sum())
     counts = [int(cnt.get(lb, 0)) for lb in POWER_SEGMENT_LABELS]
-    pcts = [f"{(c / total * 100):.1f}%" if total else "0%" for c in counts]
+    pcts = (
+        format_share_ratios_4dp_max_remainder_floats([float(c) for c in counts])
+        if total
+        else [0.0] * len(POWER_SEGMENT_LABELS)
+    )
     return pd.DataFrame(
         {
             "功率段": POWER_SEGMENT_LABELS,
@@ -99,26 +121,70 @@ def power_distribution_by_province_tables(
 
     df = df.copy()
     df["_prov_"] = df[prov_col].fillna("未知").astype(str)
-    for prov in sorted(df["_prov_"].unique(), key=lambda x: (x == "未知", x)):
+    prov_names = province_names_with_taiwan(df["_prov_"].unique().tolist())
+    for prov in prov_names:
         sub = df[df["_prov_"] == prov]
         s = pd.to_numeric(sub[col], errors="coerce")
         valid = sub.loc[s.dropna().index]
         sheet = _sanitize_sheet_name(prov, used_names)
-        out.append((sheet, _power_segment_table_from_valid_df(valid, col)))
+        if prov == TAIWAN_PROVINCE and sub.empty:
+            out.append((sheet, _taiwan_placeholder_power_table()))
+        else:
+            out.append((sheet, _power_segment_table_from_valid_df(valid, col)))
     return out
 
 
-def write_power_province_workbook(df: pd.DataFrame, for_pile: bool = True) -> Optional[BytesIO]:
-    """多 Sheet xlsx；无功率列返回 None。"""
+def _build_power_total_long_table(pairs: List[Tuple[str, pd.DataFrame]]) -> pd.DataFrame:
+    """各省分档纵向合并为一表，列：省份、功率段、数量、占比、环比（与分省 Sheet 内容一致）。"""
+    rows: List[dict] = []
+    for sheet_name, tbl in pairs:
+        if tbl is None or tbl.empty:
+            continue
+        for _, r in tbl.iterrows():
+            rows.append(
+                {
+                    "省份": sheet_name,
+                    "功率段": r.get("功率段", ""),
+                    "数量": r.get("数量", ""),
+                    "占比": r.get("占比", ""),
+                    "环比": r.get("环比", ""),
+                }
+            )
+    if not rows:
+        return pd.DataFrame(columns=["省份", "功率段", "数量", "占比", "环比"])
+    return pd.DataFrame(rows)
+
+
+def write_power_province_workbook(
+    df: pd.DataFrame,
+    for_pile: bool = True,
+    *,
+    prepend_total_sheet: bool = False,
+) -> Optional[BytesIO]:
+    """
+    多 Sheet xlsx；无功率列返回 None。
+    prepend_total_sheet=True 时（单独导出功率段产品）：最前增加 Sheet「总」，
+    首行表头为 省份 | 功率段 | 数量 | 占比 | 环比，其后为各省分档纵向合并。
+    一键七表 ZIP 内仍为 prepend_total_sheet=False，保持与线上一致。
+    写出前对各 Sheet 数据区逐格扫描：凡文本中含 %／％ 一律转为 0～1 小数（四位）。
+    """
     pairs = power_distribution_by_province_tables(df, for_pile=for_pile)
     if not pairs:
         return None
     buf = BytesIO()
+    used_sheets: set = set()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        if prepend_total_sheet:
+            total_df = dataframe_cells_percent_to_decimal_ratio(
+                _build_power_total_long_table(pairs)
+            )
+            sum_name = _sanitize_sheet_name("总", used_sheets)
+            total_df.to_excel(writer, sheet_name=sum_name[:31], index=False)
         for sheet_name, tbl in pairs:
-            # pandas 对 sheet 名长度会处理，但先保证 sanitize
-            safe = sheet_name[:31]
-            tbl.to_excel(writer, sheet_name=safe, index=False)
+            safe = _sanitize_sheet_name(sheet_name, used_sheets)[:31]
+            dataframe_cells_percent_to_decimal_ratio(tbl).to_excel(
+                writer, sheet_name=safe, index=False
+            )
     buf.seek(0)
     return buf
 
@@ -148,11 +214,9 @@ def list_power_preview_provinces(df: pd.DataFrame, for_pile: bool = True) -> Lis
     if prov_col is None:
         return ["全部"]
     df = df.copy()
-    names = sorted(
-        df[prov_col].fillna("未知").astype(str).unique().tolist(),
-        key=lambda x: (x == "未知", x),
+    return province_names_with_taiwan(
+        df[prov_col].fillna("未知").astype(str).unique().tolist()
     )
-    return names
 
 
 def power_distribution_table_for_province(
@@ -166,6 +230,10 @@ def power_distribution_table_for_province(
     if prov_col is None or province == "全部":
         s = pd.to_numeric(df[col], errors="coerce")
         return _power_segment_table_from_valid_df(df.loc[s.dropna().index], col)
+    if province == TAIWAN_PROVINCE:
+        sub0 = df[df[prov_col].fillna("未知").astype(str) == province]
+        if sub0.empty:
+            return _taiwan_placeholder_power_table()
     sub = df[df[prov_col].fillna("未知").astype(str) == province]
     s = pd.to_numeric(sub[col], errors="coerce")
     return _power_segment_table_from_valid_df(sub.loc[s.dropna().index], col)

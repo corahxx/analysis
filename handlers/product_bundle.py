@@ -6,6 +6,7 @@ from typing import Optional
 
 import pandas as pd
 
+from handlers.data_utils import province_names_with_taiwan
 from handlers.highway_template import build_highway_workbook_bytes
 
 
@@ -32,6 +33,27 @@ def build_seven_products_zip_bytes(
         if xlsx_bytes:
             zf.writestr(f"{prefix}/{arc_name}", xlsx_bytes)
 
+    def _build_highway_province_placeholder(df0) -> pd.DataFrame:
+        if df0 is None:
+            names = province_names_with_taiwan([])
+        elif "省份_中文" in df0.columns:
+            names = province_names_with_taiwan(
+                df0["省份_中文"].fillna("未知").astype(str).tolist()
+            )
+        elif "省份" in df0.columns:
+            names = province_names_with_taiwan(
+                df0["省份"].fillna("未知").astype(str).tolist()
+            )
+        else:
+            names = province_names_with_taiwan([])
+        return pd.DataFrame(
+            {
+                "省份": names,
+                "高速公路沿线已建设及预留建设充电停车位服务区": ["\\"] * len(names),
+                "高速公路沿线已建设充电停车位总数": ["\\"] * len(names),
+            }
+        )
+
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         # 1 车桩比
         if ratio_mod is not None:
@@ -44,7 +66,9 @@ def build_seven_products_zip_bytes(
                 pass
 
         # 2 高速公路（与业务模板一致的双 Sheet 结构；无省份指标时空表）
-        hw = build_highway_workbook_bytes(None)
+        hw = build_highway_workbook_bytes(
+            _build_highway_province_placeholder(df), fill_empty_with="\\"
+        )
         _add_xlsx("02_高速公路_占位.xlsx", hw.getvalue())
 
         # 3 功率段分布

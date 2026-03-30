@@ -3,7 +3,11 @@
 from typing import Optional
 import pandas as pd
 
-from .data_utils import agg_pile_count, agg_station_count
+from .data_utils import (
+    agg_pile_count,
+    agg_station_count,
+    format_share_ratios_4dp_max_remainder_floats,
+)
 
 
 def _province_col(df: pd.DataFrame) -> Optional[str]:
@@ -43,6 +47,8 @@ def citygroup_provinces_table(df: pd.DataFrame, for_pile: bool = True, group_nam
     total = agg.sum()
     out = agg.sort_values(ascending=False).reset_index()
     out.columns = ["省份", "数量"]
-    out["占比"] = (out["数量"] / total * 100).round(1).astype(str) + "%"
+    out["占比"] = format_share_ratios_4dp_max_remainder_floats(
+        [float(x) for x in out["数量"].tolist()]
+    )
     out["环比"] = "—"
     return out
