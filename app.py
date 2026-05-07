@@ -329,14 +329,8 @@ def _render_raw_to_standard00_page() -> None:
         st.info("请上传原始汇总 xlsx。")
 
 
-def _render_power_table_mom_page() -> None:
-    """侧栏「功率表添加环比」：对目录内多月份功率段 xlsx 原地写入环比列。"""
-    st.markdown(_banner_with_background("product-banner.png"), unsafe_allow_html=True)
-    st.markdown(
-        '<p style="color:#546e7a;font-size:0.95rem;font-weight:500;margin:1.5rem 0 1rem 0;letter-spacing:0.02em;">'
-        "功率表添加环比</p>",
-        unsafe_allow_html=True,
-    )
+def _render_power_folder_mode() -> None:
+    """子模式「功率表添加」：对目录内多月份功率段 xlsx 原地写入环比列。"""
     st.markdown("### 说明")
     st.caption(
         "将**同一文件夹**内、文件名以 **_YYYYMM.xlsx** 结尾的功率段工作簿按月份排序，"
@@ -364,6 +358,82 @@ def _render_power_table_mom_page() -> None:
             st.error(msg)
             for line in details:
                 st.code(line)
+
+
+def _render_other_table_mode() -> None:
+    """子模式「其他表添加」：支持输入两个文件或两个文件夹，自动判别月份后给本期回填占比/环比/环比增量。"""
+    st.markdown("### 说明")
+    st.caption(
+        "支持两种输入方式：**两个 xlsx 文件路径**或**两个文件夹路径**。"
+        "文件/文件夹名末 4 位为 **YYMM**（如 `充电桩_2602.xlsx` 或文件夹 `2602`），"
+        "系统按名称识别年月（`YY`→`20YY` 年），**新月份**作为本期被写回。"
+        "文件夹模式下自动配对两个文件夹内**同名** xlsx 并逐个处理。"
+        "对每个 Sheet 读取**第一行表头**：「占比/全国占比」计算本期占比（四位小数）；"
+        "「环比/环比增速」按 (本期−上期)/上期 计算（四位小数）；「环比增量/环比变化」按 本期−上期 计算。"
+        "行对齐使用每个 Sheet 的**最左列**作为 key；上期找不到对应行时写 **`\\`**。"
+    )
+    p1 = st.text_input("路径 1（文件或文件夹）", key="mom_other_p1",
+                        placeholder=r"例如：D:\数据\充电桩_2601.xlsx 或 D:\数据\2601")
+    p2 = st.text_input("路径 2（文件或文件夹）", key="mom_other_p2",
+                        placeholder=r"例如：D:\数据\充电桩_2602.xlsx 或 D:\数据\2602")
+    if st.button("一键增加环比", type="primary", key="mom_other_run"):
+        import os
+        _pa = (p1 or "").strip().strip('"').strip("'")
+        _pb = (p2 or "").strip().strip('"').strip("'")
+        _pa = os.path.abspath(os.path.expandvars(os.path.expanduser(_pa))) if _pa else ""
+        _pb = os.path.abspath(os.path.expandvars(os.path.expanduser(_pb))) if _pb else ""
+        is_dir_a = os.path.isdir(_pa) if _pa else False
+        is_dir_b = os.path.isdir(_pb) if _pb else False
+
+        if is_dir_a and is_dir_b:
+            from handlers.generic_table_mom import fill_generic_mom_from_two_folders
+            with st.spinner("正在解析文件夹并逐文件写回…"):
+                ok, msg, details, targets = fill_generic_mom_from_two_folders(p1, p2)
+            if ok:
+                st.success(msg)
+                for line in details:
+                    st.write(line)
+            else:
+                st.error(msg)
+                for line in details:
+                    st.code(line)
+        elif not is_dir_a and not is_dir_b:
+            from handlers.generic_table_mom import fill_generic_mom_from_two
+            with st.spinner("正在解析并写回 Excel…"):
+                ok, msg, details, target = fill_generic_mom_from_two(p1, p2)
+            if ok:
+                st.success(msg)
+                if target:
+                    st.write(f"已写回：`{target}`")
+                for line in details:
+                    st.write(line)
+            else:
+                st.error(msg)
+                for line in details:
+                    st.code(line)
+        else:
+            st.error("请保持输入一致：两个都是文件路径，或两个都是文件夹路径。")
+
+
+def _render_mom_page() -> None:
+    """侧栏「环比添加」：含「功率表添加」「其他表添加」两个子模式。"""
+    st.markdown(_banner_with_background("product-banner.png"), unsafe_allow_html=True)
+    st.markdown(
+        '<p style="color:#546e7a;font-size:0.95rem;font-weight:500;margin:1.5rem 0 1rem 0;letter-spacing:0.02em;">'
+        "环比添加</p>",
+        unsafe_allow_html=True,
+    )
+    sub = st.radio(
+        "子模式",
+        options=["功率表添加", "其他表添加"],
+        index=0,
+        key="mom_sub_mode",
+        horizontal=True,
+    )
+    if sub == "功率表添加":
+        _render_power_folder_mode()
+    else:
+        _render_other_table_mode()
 
 
 # 必备列（与 merge 规范一致，至少具备关键列即可入库）
@@ -557,11 +627,12 @@ _NAV_OPTIONS = [
     "标准化数据产品-由数据库生成",
     "标准化数据产品-由原始表生成标准00表",
     "标准化数据产品-由标准00表生成",
-    "功率表添加环比",
+    "环比添加",
 ]
 _LEGACY_VIEW_MODE = {
     "标准化数据产品": "标准化数据产品-由数据库生成",
     "由标准00表转化": "标准化数据产品-由标准00表生成",
+    "功率表添加环比": "环比添加",
 }
 if "view_mode" not in st.session_state:
     st.session_state.view_mode = "入库"
@@ -1053,8 +1124,8 @@ elif st.session_state.view_mode == "标准化数据产品-由标准00表生成":
 elif st.session_state.view_mode == "标准化数据产品-由原始表生成标准00表":
     _render_raw_to_standard00_page()
 
-elif st.session_state.view_mode == "功率表添加环比":
-    _render_power_table_mom_page()
+elif st.session_state.view_mode == "环比添加":
+    _render_mom_page()
 
 else:
     # ========== 标准化数据产品页：顶部图块 + 标题（图下，与 ### 区分） ==========

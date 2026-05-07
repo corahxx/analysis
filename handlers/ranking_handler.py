@@ -106,12 +106,16 @@ def sheet_star_station(df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+_MODEL_RANK_SKIP = frozenset(("未知", "充电桩", "暂无"))
+
+
 def sheet_model_rank(df: pd.DataFrame, for_pile: bool) -> pd.DataFrame:
-    """型号榜：桩表按充电桩型号行数；站表仅表头。"""
+    """型号榜：桩表按充电桩型号行数；站表仅表头。排除设备型号为「未知/充电桩/暂无」的记录。"""
     cols = ["设备型号", "装机量"]
     if not for_pile or "充电桩型号" not in df.columns:
         return pd.DataFrame(columns=cols)
     g = df.groupby(df["充电桩型号"].fillna("未知").astype(str), dropna=False).size()
+    g = g[~g.index.isin(_MODEL_RANK_SKIP)]
     g = g.sort_values(ascending=False)
     return pd.DataFrame(
         {

@@ -595,47 +595,9 @@ def build_ranking_workbook(
     else:
         df_sales = pd.DataFrame(columns=scols)
 
-    # 城市榜 Top10
+    # 城市榜 Top10（仅输出表头，不生成内容）
     ccols = ["城市", "公共充电设施总量", "全国占比", "环比增速"]
-    city_prev_map: Dict[str, float] = {}
-    if prev and "城市" in prev and not prev["城市"].empty:
-        cp = prev["城市"]
-        if "城市" in cp.columns and "公共充电设施总量" in cp.columns:
-            for _, r in cp.iterrows():
-                kk = _city_display_label(r.get("城市"))
-                if not kk:
-                    continue
-                pv = _num(r.get("公共充电设施总量"))
-                if pv is not None:
-                    city_prev_map[kk] = pv
     df_city = pd.DataFrame(columns=ccols)
-    if "城市" in cur and not cur["城市"].empty:
-        cd = cur["城市"]
-        if "城市" in cd.columns and "公共充电设施总量" in cd.columns:
-            cvals: List[Tuple[str, float]] = []
-            for _, r in cd.iterrows():
-                kk = _city_display_label(r.get("城市"))
-                if not kk:
-                    continue
-                v = _num(r.get("公共充电设施总量"))
-                if v is None:
-                    continue
-                cvals.append((kk, v))
-            cvals.sort(key=lambda x: -x[1])
-            national_total = sum(v for _, v in cvals)
-            top = cvals[:10]
-            cr = []
-            for kk, v in top:
-                pct = f"{(v / national_total):.4f}" if national_total > 0 else "0.0000"
-                cr.append(
-                    {
-                        "城市": kk,
-                        "公共充电设施总量": int(v) if abs(v - round(v)) < 1e-9 else v,
-                        "全国占比": pct,
-                        "环比增速": _fmt_mom_growth(v, city_prev_map.get(kk)),
-                    }
-                )
-            df_city = pd.DataFrame(cr, columns=ccols)
 
     # 星级场站榜
     stcols = ["运营商", "星级场站数", "占比", "五星级场站数"]
