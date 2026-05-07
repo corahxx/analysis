@@ -155,6 +155,16 @@ def write_national_workbook_bytes(df: pd.DataFrame, for_pile: bool = True) -> By
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         for sheet_name, tbl in get_national_workbook_tables(df, for_pile=for_pile):
             safe = sheet_name[:31]
+            if sheet_name == "充电电量" and not tbl.empty and "数量" in tbl.columns:
+                tbl = tbl.copy()
+                tbl["数量"] = tbl["数量"].apply(
+                    lambda x: (
+                        int(round(x / 10000.0))
+                        if isinstance(x, (int, float))
+                        and abs(x / 10000.0 - round(x / 10000.0)) < 1e-9
+                        else (x / 10000.0 if isinstance(x, (int, float)) else x)
+                    )
+                )
             tbl.to_excel(writer, sheet_name=safe, index=False)
     buf.seek(0)
     return buf

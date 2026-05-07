@@ -622,11 +622,11 @@ def build_ranking_workbook(
                     continue
                 cvals.append((kk, v))
             cvals.sort(key=lambda x: -x[1])
+            national_total = sum(v for _, v in cvals)
             top = cvals[:10]
-            tvals = [v for _, v in top]
-            cpcts = format_pct_share_strings_two_dp(tvals)
             cr = []
-            for (kk, v), pct in zip(top, cpcts):
+            for kk, v in top:
+                pct = f"{(v / national_total):.4f}" if national_total > 0 else "0.0000"
                 cr.append(
                     {
                         "城市": kk,

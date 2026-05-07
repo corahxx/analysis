@@ -332,7 +332,11 @@ def _render_raw_to_standard00_page() -> None:
 def _render_power_table_mom_page() -> None:
     """侧栏「功率表添加环比」：对目录内多月份功率段 xlsx 原地写入环比列。"""
     st.markdown(_banner_with_background("product-banner.png"), unsafe_allow_html=True)
-    st.markdown('<p class="page-subtitle">功率表添加环比</p>', unsafe_allow_html=True)
+    st.markdown(
+        '<p style="color:#546e7a;font-size:0.95rem;font-weight:500;margin:1.5rem 0 1rem 0;letter-spacing:0.02em;">'
+        "功率表添加环比</p>",
+        unsafe_allow_html=True,
+    )
     st.markdown("### 说明")
     st.caption(
         "将**同一文件夹**内、文件名以 **_YYYYMM.xlsx** 结尾的功率段工作簿按月份排序，"
